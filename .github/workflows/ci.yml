@@ -1,8 +1,16 @@
 name: CI
 
 on:
+  # Branch pushes are covered by pull_request; push runs only for main, so a PR commit runs CI once
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push to a PR cancels its superseded run; runs on main always finish
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # pg_dump refuses to dump a newer server, so the client tracks the newest PostgreSQL in the matrix
