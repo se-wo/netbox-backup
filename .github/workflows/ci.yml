@@ -20,8 +20,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        netbox: ['v4.4.9', 'v4.7.3']
-        postgres: ['14', '17']
+        include:
+          # Each NetBox release against its minimum supported PostgreSQL and a current one
+          - netbox: 'v4.4.9'
+            postgres: '14'
+          - netbox: 'v4.4.9'
+            postgres: '17'
+          - netbox: 'v4.7.3'
+            postgres: '15'
+          - netbox: 'v4.7.3'
+            postgres: '17'
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -63,5 +71,9 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/netbox-backup/testing
           NETBOX_CONFIGURATION: netbox_backup_testing
         run: |
+          set -o pipefail
           python manage.py makemigrations netbox_backup --check --dry-run
-          python manage.py test netbox_backup --noinput -v 2
+          python manage.py test netbox_backup --noinput -v 2 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - name: Annotate test failures
+        if: failure()
+        run: python netbox-backup/.github/scripts/annotate_failures.py "$RUNNER_TEMP/test.log"
