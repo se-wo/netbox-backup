@@ -1,0 +1,16 @@
+{% load i18n %}
+{% if denied %}
+  <div class="text-muted">{% trans "No permission to view backups." %}</div>
+{% elif error %}
+  <div class="text-danger">{{ error }}</div>
+{% else %}
+  <div class="d-flex align-items-center mb-2">
+    <span class="badge text-bg-{{ color }} fs-5 me-2">{{ overall|upper }}</span>
+    <a href="{% url 'plugins:netbox_backup:status' %}">{% trans "Backup status" %}</a>
+  </div>
+  {% for c in problems %}
+    <div class="small"><span class="text-{{ c.color }} mdi mdi-circle"></span> <strong>{{ c.name }}</strong>{% if c.subject %} ({{ c.subject }}){% endif %}: {{ c.message }}</div>
+  {% empty %}
+    <div class="small text-muted">{% trans "Every policy is current and a locked off-site copy exists." %}</div>
+  {% endfor %}
+{% endif %}

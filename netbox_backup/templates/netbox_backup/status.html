@@ -1,0 +1,75 @@
+{% extends 'generic/_base.html' %}
+{% load helpers %}
+{% load i18n %}
+
+{% block title %}{% trans "Backup status" %}{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <div class="col col-12 col-lg-7">
+      <div class="card">
+        <h2 class="card-header">{% trans "Health" %}<div class="card-actions"><span class="badge text-bg-{{ overall_color }}">{{ overall|upper }}</span></div></h2>
+        <table class="table table-hover">
+          {% for c in conditions %}
+            <tr>
+              <td class="text-nowrap"><span class="badge text-bg-{{ c.color }}">{{ c.status|upper }}</span></td>
+              <td class="text-nowrap"><strong>{{ c.name }}</strong>{% if c.subject %} <span class="text-muted">{{ c.subject }}</span>{% endif %}</td>
+              <td>{{ c.message }}</td>
+            </tr>
+          {% endfor %}
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Policies" %}</h2>
+        <table class="table table-hover">
+          <thead><tr><th>{% trans "Policy" %}</th><th>{% trans "Last verified set" %}</th><th>{% trans "Next run" %}</th><th>{% trans "Worst-case loss" %}</th></tr></thead>
+          {% for p in policies %}
+            <tr>
+              <td>{{ p.row|linkify }}</td>
+              <td>{% if p.newest %}{{ p.newest|linkify }} <small class="text-muted">{{ p.newest.finished|isodatetime }}</small>{% else %}{{ ''|placeholder }}{% endif %}</td>
+              <td>{{ p.next_run|isodatetime|placeholder }}</td>
+              <td>{{ p.loss|placeholder }}</td>
+            </tr>
+          {% endfor %}
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Copies" %} <small class="text-muted">{% trans "set x target" %}</small></h2>
+        <table class="table table-hover">
+          <thead><tr><th>{% trans "Set" %}</th>{% for t in targets %}<th>{{ t.name }}</th>{% endfor %}</tr></thead>
+          {% for row in matrix %}
+            <tr>
+              <td>{{ row.set|linkify }} {% badge row.set.get_status_display bg_color=row.set.get_status_color %}</td>
+              {% for c in row.copies %}
+                <td>{% if c %}{% badge c.get_status_display bg_color=c.get_status_color %}{% if c.locked_until %} <i class="mdi mdi-lock" title="{{ c.locked_until|isodatetime }}"></i>{% endif %}{% else %}{{ ''|placeholder }}{% endif %}</td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+        </table>
+      </div>
+    </div>
+    <div class="col col-12 col-lg-5">
+      <div class="card">
+        <h2 class="card-header">{% trans "Install" %}</h2>
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">{% trans "Instance" %}</th><td><code>{{ instance_id }}</code></td></tr>
+          <tr><th scope="row">{% trans "Scheduler last run" %}</th><td>{{ last_tick|isodatetime|placeholder }}</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Capacity" %}</h2>
+        <table class="table table-hover">
+          {% for c in capacity %}
+            <tr><td>{{ c.target|linkify }}</td><td>{{ c.used|filesizeformat }}</td><td>{% if c.percent is not None %}{{ c.percent }}% {% trans "of quota" %}{% endif %}</td></tr>
+          {% endfor %}
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Recent restores" %}</h2>
+        <ul class="list-group list-group-flush">
+          {% for r in restores %}<li class="list-group-item">{{ r|linkify }} {% badge r.get_status_display bg_color=r.get_status_color %} <small class="text-muted">{{ r.started|isodatetime }}</small></li>{% empty %}<li class="list-group-item text-muted">{% trans "None" %}</li>{% endfor %}
+        </ul>
+      </div>
+    </div>
+  </div>
+{% endblock %}

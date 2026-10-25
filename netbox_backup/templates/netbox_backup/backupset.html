@@ -1,0 +1,81 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+{% load humanize %}
+{% load render_table from django_tables2 %}
+{% load i18n %}
+
+{% block extra_controls %}
+  {% if can_verify %}
+    <form action="{% url 'plugins:netbox_backup:backupset_verify' pk=object.pk %}" method="post" class="d-inline">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-cyan"><i class="mdi mdi-check-decagram"></i> {% trans "Verify (level 1)" %}</button>
+    </form>
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+  {% if object.error %}<div class="alert alert-danger"><i class="mdi mdi-alert-octagon"></i> {{ object.error }}</div>{% endif %}
+  {% for warning in object.warnings %}<div class="alert alert-warning"><i class="mdi mdi-alert"></i> {{ warning }}</div>{% endfor %}
+  <div class="row">
+    <div class="col col-12 col-md-6">
+      <div class="card">
+        <h2 class="card-header">{% trans "Backup set" %}</h2>
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">{% trans "Set" %}</th><td><code>{{ object.set_id }}</code></td></tr>
+          <tr><th scope="row">{% trans "Status" %}</th><td>{% badge object.get_status_display bg_color=object.get_status_color %}</td></tr>
+          <tr><th scope="row">{% trans "Verified" %}</th><td>{% badge object.get_verify_level_display bg_color=object.get_verify_level_color %} {% if object.verified_at %}<small class="text-muted">{{ object.verified_at|isodatetime }}</small>{% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Policy" %}</th><td>{% if object.policy %}{{ object.policy|linkify }}{% else %}{{ object.policy_name|placeholder }}{% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Trigger" %}</th><td>{{ object.get_trigger_display }}{% if object.created_by %} ({{ object.created_by }}){% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Instance" %}</th><td><code>{{ object.instance_id }}</code></td></tr>
+          <tr><th scope="row">{% trans "Started" %}</th><td>{{ object.started|isodatetime|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Finished" %}</th><td>{{ object.finished|isodatetime|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Size" %}</th><td>{% if object.size_bytes is not None %}{{ object.size_bytes|filesizeformat }}{% else %}{{ ''|placeholder }}{% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Manifest SHA-384" %}</th><td><code class="text-break">{{ object.manifest_sha384|placeholder }}</code></td></tr>
+          <tr><th scope="row">{% trans "Job" %}</th><td>{% if object.job %}{{ object.job|linkify }}{% else %}{{ ''|placeholder }}{% endif %}</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Compatibility with this install" %}</h2>
+        <div class="card-body">
+          {% if compatible %}<span class="text-success mdi mdi-check-bold"></span>{% elif compatible is None %}<span class="text-muted mdi mdi-help"></span>{% else %}<span class="text-danger mdi mdi-close-thick"></span>{% endif %}
+          NetBox {{ object.netbox_version|placeholder }}: {{ compatibility_reason }}
+          <p class="text-muted mt-2 mb-0">{% trans "Restores run from an ops shell; start with" %} <code>{{ restore_command }}</code></p>
+        </div>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Components" %}</h2>
+        <table class="table table-hover">
+          <thead><tr><th>{% trans "Component" %}</th><th>{% trans "Stored" %}</th><th>{% trans "Contents" %}</th></tr></thead>
+          {% for name, c in object.components.items %}
+            <tr>
+              <td>{{ name }}</td><td>{{ c.size|filesizeformat }}</td>
+              <td class="text-muted">
+                {% if c.rows is not None %}{{ c.tables }} {% trans "tables" %}, {{ c.rows|intcomma }} {% trans "rows" %}{% if c.dump_checked %}, {% trans "dump checked" %}{% endif %}{% endif %}
+                {% if c.files is not None %}{{ c.files|intcomma }} {% trans "files" %}{% if c.bytes %}, {{ c.bytes|filesizeformat }}{% endif %}{% if c.missing %} <span class="text-warning">{{ c.missing }} {% trans "missing" %}</span>{% endif %}{% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </table>
+      </div>
+    </div>
+    <div class="col col-12 col-md-6">
+      <div class="card">
+        <h2 class="card-header">{% trans "Copies" %}</h2>
+        {% render_table copies 'inc/table.html' %}
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Baseline" %} <small class="text-muted">{{ table_count }} {% trans "tables" %}</small></h2>
+        {% if top_tables %}
+          <table class="table table-hover">
+            {% for name, count in top_tables %}<tr><td><code>{{ name }}</code></td><td class="text-end">{{ count|intcomma }}</td></tr>{% endfor %}
+          </table>
+          <div class="card-body">
+            {% for schema, counts in schemas.items %}<div><code>{{ schema }}</code>: {{ counts.indexes }} {% trans "indexes" %}, {{ counts.constraints }} {% trans "constraints" %}, {{ counts.triggers }} {% trans "triggers" %}</div>{% endfor %}
+          </div>
+        {% else %}
+          <div class="card-body text-muted">{% trans "The baseline is in the encrypted manifest body; it is shown for sets taken by this install." %}</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+{% endblock %}

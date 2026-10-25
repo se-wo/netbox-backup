@@ -45,7 +45,7 @@ class Database:
     @classmethod
     def from_dsn(cls, dsn, **binaries):
         params = psycopg.conninfo.conninfo_to_dict(dsn)
-        password = params.pop('password', None)
+        password = params.pop('password', None) or os.environ.get('PGPASSWORD')
         return cls(params, password=password, **binaries)
 
     @property

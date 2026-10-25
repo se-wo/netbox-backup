@@ -1,0 +1,50 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+{% load i18n %}
+
+{% block content %}
+  <div class="row">
+    <div class="col col-12 col-md-6">
+      <div class="card">
+        <h2 class="card-header">{% trans "Storage target" %}</h2>
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">{% trans "Name" %}</th><td>{{ object.name }}</td></tr>
+          <tr><th scope="row">{% trans "Backend" %}</th><td><code>{{ object.backend }}</code></td></tr>
+          <tr><th scope="row">{% trans "Location" %}</th><td><code>{{ object.location|placeholder }}</code></td></tr>
+          <tr><th scope="row">{% trans "Retention" %}</th><td>{% if object.retention_days %}{{ object.retention_days }} {% trans "days, bucket default retention" %}{% else %}<span class="text-warning">{% trans "none: sets on this target are not immutable" %}</span>{% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Quota" %}</th><td>{% if object.quota_bytes %}{{ object.quota_bytes|filesizeformat }}{% else %}{{ ''|placeholder }}{% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Off-site" %}</th><td>{% checkmark object.offsite %}</td></tr>
+          <tr><th scope="row">{% trans "Enabled" %}</th><td>{% checkmark object.enabled %}</td></tr>
+          <tr><th scope="row">{% trans "Secret references" %}</th><td>{% for k, v in object.secret_refs.items %}<div><code>{{ k }}</code>: <code>{{ v }}</code></div>{% empty %}{{ ''|placeholder }}{% endfor %}</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Options (static configuration)" %}</h2>
+        <pre class="card-body mb-0">{{ object.config|json }}</pre>
+      </div>
+    </div>
+    <div class="col col-12 col-md-6">
+      <div class="card">
+        <h2 class="card-header">{% trans "Last probe" %} {% if object.last_probe_at %}<small class="text-muted">{{ object.last_probe_at|isodatetime }}</small>{% endif %}</h2>
+        {% if object.last_probe %}
+          <table class="table table-hover">
+            {% for c in object.last_probe.checks %}
+              <tr>
+                <td>{% if c.ok %}<span class="text-success mdi mdi-check-bold"></span>{% elif c.required %}<span class="text-danger mdi mdi-close-thick"></span>{% else %}<span class="text-warning mdi mdi-alert"></span>{% endif %}</td>
+                <td>{{ c.check }}</td><td class="text-muted">{{ c.detail }}</td>
+              </tr>
+            {% endfor %}
+          </table>
+        {% else %}
+          <div class="card-body text-muted">{% trans "Never probed. Run" %} <code>manage.py nbbackup target probe {{ object.name }}</code></div>
+        {% endif %}
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Policies" %}</h2>
+        <ul class="list-group list-group-flush">
+          {% for p in policies %}<li class="list-group-item">{{ p|linkify }}</li>{% empty %}<li class="list-group-item text-muted">{% trans "None" %}</li>{% endfor %}
+        </ul>
+      </div>
+    </div>
+  </div>
+{% endblock %}

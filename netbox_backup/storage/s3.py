@@ -256,6 +256,14 @@ class S3Backend(StorageBackend):
     def open_write(self, key, size_hint=None):
         return S3Writer(self, key, size_hint)
 
+    def presign(self, key, expires=300):
+        """
+        A presigned GET URL for one object (ciphertext), valid for at most five minutes.
+        """
+        return self.client.generate_presigned_url(
+            'get_object', Params={'Bucket': self.bucket, 'Key': self.full_key(key)}, ExpiresIn=min(expires, 300),
+        )
+
     def open_read(self, key, version=None):
         kwargs = {'Bucket': self.bucket, 'Key': self.full_key(key)}
         if version:

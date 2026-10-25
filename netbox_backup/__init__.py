@@ -24,8 +24,13 @@ if PluginConfig is not None:
         def ready(self):
             super().ready()
             # Never touches the database: restore commands run against an empty or unmigrated one
-            from . import jobs  # noqa: F401  registers the scheduler system job
+            from django.conf import settings
+
+            from . import jobs, widgets  # noqa: F401  registers the scheduler system job and the dashboard widget
             from .models import register_actions
             register_actions()
+            if getattr(settings, 'METRICS_ENABLED', False):
+                from .metrics import register
+                register()
 
     config = NetBoxBackupConfig
