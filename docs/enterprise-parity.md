@@ -27,7 +27,7 @@ S3, and a manual kubectl procedure. This table maps every documented behaviour t
 
 | Milestone | Scope | Status |
 |---|---|---|
-| M1 Core | Full sets; s3, azure_blob, local; GnuPG encryption and signing; signed manifest; GFS retention on bucket default retention; prune with a separate credential; restore in place or via marked slot and switch; level-1 integrity; metrics and alert rules; `status --json`; external check; standalone CLI | Implemented |
+| M1 Core | Full sets; s3, azure_blob, local; GnuPG encryption and signing; signed manifest; GFS retention on bucket default retention; prune with a separate credential; restore in place or via marked slot and switch; level-1 integrity; metrics and alert rules; `status --json`; external check; standalone CLI | Implemented; round trip, crash and tamper tests green in CI; the nightly Azure Flexible Server run is not set up yet |
 | M2 Backends and drills | gcs, sftp, rclone; replicas (ReplicateJob, server-side within a provider, recorded copy checksums); QA restore instance (`qa run`, `finish --qa` with `migrate --check` and an API smoke test, reports signed with the QA key and imported by production); scheduled drills measure server headroom | Implemented; exit criterion (monthly QA restore green on a reference install for 3 months) pending |
 | M3 Browse | Load a set into the slot read-only, diff objects against live, export selected objects | Planned |
 | Later | Incremental media; provider-clone load (`--from-dsn`); pgBackRest configuration for self-hosted servers | On demand |

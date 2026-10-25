@@ -268,9 +268,9 @@ reads storage directly and never touches the catalog, so it also works on a fres
 | PostgreSQL | the server major is older than the set's, or pg_restore is older than the pg_dump that wrote it | abort |
 | Slot | missing marker, other sessions, not owned by the NetBox role, or an unfinalized rollback copy | abort, printing the command needed |
 | Ownership | an archive schema exists in the target but isn't the role's, or a foreign-owned extension would survive emptying | abort before anything is deleted |
-| Locks | the relations involved exceed half the server's lock capacity | abort |
+| Locks | the relations involved exceed half the server's lock capacity, or other roles hold locks on the role's relations | abort, naming the roles holding locks |
 | Redis | tasks and cache share one Redis database | warn; only RQ keys and the config cache keys are deleted |
-| Space | the local spool is too small, or server headroom is not confirmed (`--headroom-confirmed`) | abort; Azure Flexible Server turns read-only server-wide at 95 % used |
+| Space | the local spool is too small; for slot loads and drills, server headroom is neither confirmed (`--headroom-confirmed`) nor measured within the `headroom` threshold | abort; Azure Flexible Server turns read-only server-wide at 95 % used |
 | Instance | the set belongs to another `instance_id`, or this install's `instance_id` is not pinned | requires `--from-instance <id>` (`nbbackup list --all-instances`); QA restores and `restore-db` need a pinned ID |
 | Grantees | roles the dump grants to don't exist on this server | warn; loaded without privileges, the dropped GRANT/REVOKE/ALTER DEFAULT PRIVILEGES lines are kept in the journal (`dropped_grants`) |
 | Peppers | restored v2 tokens reference pepper IDs missing from `API_TOKEN_PEPPERS` | warn: those tokens stop validating |

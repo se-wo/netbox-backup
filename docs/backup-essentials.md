@@ -20,8 +20,11 @@ snapshots for that layer).
 
 1. Install the plugin, GnuPG 2.4+ and the newest `postgresql-client` on the NetBox host and the worker.
 2. Pick an **off-host target with immutability**: an S3 bucket with object lock (COMPLIANCE default retention, e.g.
-   35 days) and a lifecycle rule aborting incomplete uploads after one day, or an Azure container with locked
-   version-level immutability. A set on the database's own disk is not a DR backup.
+   35 days) and a lifecycle rule aborting incomplete uploads after one day, an Azure container with locked
+   version-level immutability, or a GCS bucket with a locked retention policy. A set on the database's own disk is
+   not a DR backup (a `local` target there is refused). For a second copy, add a replica target to the policy
+   (`replicas`): an SFTP server or NAS for air-gapped sites, another cloud through rclone; every set is copied and
+   verified there too.
 3. Generate three keys with `nbbackup keys generate --role ops|signing|recovery`. The **ops** key decrypts
    restores; keep it in a secret store and mount it only for restores. The **recovery** key is generated offline
    with a passphrase and stays offline (a printout, a smartcard, a safe): it is the last way in, and the only key
@@ -52,15 +55,23 @@ off-site copy exists. With `METRICS_ENABLED`, alert on the gauges in [the refere
 
 ## 3. Rehearse a restore
 
-A healthy backup doesn't prove restored data. With a restore slot configured, run a drill now and again (monthly is
-a good default):
+A healthy backup doesn't prove restored data. The best rehearsal is a **QA instance**: a separate NetBox with its
+own database, Redis and pinned `instance_id`, which restores production's newest set monthly and signs a report
+that production imports ([QA restore instance](backup-and-restore.md#qa-restore-instance)):
+
+```bash
+python manage.py nbbackup qa run --from-instance <production instance_id> --confirm netbox_qa   # on QA
+```
+
+Without one, run a drill in production's restore slot now and again (monthly is a good default):
 
 ```bash
 python manage.py nbbackup verify latest --drill --headroom-confirmed
 ```
 
 It loads the set into the slot, compares the baseline, checks the migration plan and empties the slot again. A pass
-marks the set as level 2 (QA restore).
+marks the set as level 2 (QA restore). For a scheduled drill (a CronJob on the maintenance runner), configure
+`headroom` instead of passing `--headroom-confirmed`, so each run measures the database server first.
 
 ## 4. Undo a mistake (bulk edit gone wrong)
 
