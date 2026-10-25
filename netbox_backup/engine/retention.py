@@ -1,87 +1,70 @@
 """
-Retention: delete backups older than the configured retention period, always keeping the newest `keep_last`
-successful backups of each kind so that a stopped schedule never prunes an instance down to nothing.
+GFS retention by count plus a minimum age.
+
+GFS decides which sets prune may delete; the target's default retention decides the earliest date it can. Only
+verified sets (level 1 passed) count toward the buckets, and the newest verified set is never pruned. Once any QA
+restore has passed, keep_min_verified keeps that many sets with a passed QA restore.
 """
-import logging
-from datetime import timedelta
-
-from django.utils import timezone
-from django.utils.dateparse import parse_datetime
-
-from .. import conf
-from ..choices import BackupKindChoices, BackupStatusChoices
-from ..storage import get_storage
-from . import catalog
-from .backup import storage_key
-
-logger = logging.getLogger('netbox_backup')
-
-# Incomplete uploads younger than this may still be in progress
-INCOMPLETE_GRACE = timedelta(hours=24)
+from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 
-def plan(now=None):
+@dataclass
+class Candidate:
+    set_id: str
+    created: object  # aware datetime
+    verified: bool
+    qa_passed: bool = False
+
+
+def _buckets(sets, count, key):
     """
-    Return the Backup rows that retention would delete.
+    Keep the newest set of each of the `count` most recent periods that contain a set.
     """
-    from ..models import Backup
-    retention = conf.retention()
-    if not retention:
-        return []
-    now = now or timezone.now()
-    cutoff = now - retention
-    keep_last = max(int(conf.get('keep_last') or 0), 0)
-    own = Backup.objects.filter(instance_id=conf.instance_id())
+    kept = {}
+    seen = []
+    for s in sets:
+        period = key(s.created)
+        if period in seen:
+            continue
+        if len(seen) >= count:
+            break
+        seen.append(period)
+        kept[s.set_id] = period
+    return kept
 
-    doomed = []
-    for kind in BackupKindChoices.values():
-        successful = own.filter(kind=kind, status__in=BackupStatusChoices.SUCCESSFUL).order_by('-started_at', '-pk')
-        for index, backup in enumerate(successful):
-            if index >= keep_last and backup.started_at and backup.started_at < cutoff:
-                doomed.append(backup)
-    unsuccessful = own.exclude(status__in=BackupStatusChoices.SUCCESSFUL).exclude(
-        status__in=(BackupStatusChoices.STATUS_RUNNING, BackupStatusChoices.STATUS_PENDING)
+
+def plan(candidates, retention, now, time_zone='UTC'):
+    """
+    Returns (keep, prune): keep maps set_id to the reasons it is kept, prune lists set_ids, newest first.
+    """
+    tz = ZoneInfo(time_zone or 'UTC')
+    ordered = sorted(candidates, key=lambda c: c.created, reverse=True)
+    verified = [c for c in ordered if c.verified]
+    local = lambda c: c.astimezone(tz)  # noqa: E731
+    keep = {}
+
+    def add(set_id, reason):
+        keep.setdefault(set_id, []).append(reason)
+
+    for c in ordered:
+        if now - c.created < retention.min_age:
+            add(c.set_id, 'min_age')
+    if verified:
+        add(verified[0].set_id, 'newest verified')
+    for c in verified[:retention.keep_last]:
+        add(c.set_id, 'last')
+    rules = (
+        ('daily', retention.keep_daily, lambda d: local(d).date()),
+        ('weekly', retention.keep_weekly, lambda d: local(d).isocalendar()[:2]),
+        ('monthly', retention.keep_monthly, lambda d: (local(d).year, local(d).month)),
+        ('yearly', retention.keep_yearly, lambda d: local(d).year),
     )
-    doomed += [b for b in unsuccessful if (b.started_at or b.created) < cutoff]
-    return doomed
-
-
-def delete_backup(backup, log=None):
-    log = log or logger
-    backup.delete()
-    log.info(f"Deleted backup {backup.name}")
-
-
-def prune(dry_run=False, log=None, now=None):
-    log = log or logger
-    storage = get_storage()
-    doomed = plan(now=now)
-    for backup in doomed:
-        if dry_run:
-            log.info(f"Would delete {backup.name} ({backup.get_status_display()}, started {backup.started_at})")
-        else:
-            delete_backup(backup, log=log)
-
-    # Directories without a manifest left by a crashed process
-    now = now or timezone.now()
-    removed_incomplete = []
-    for name in catalog.incomplete_backups(storage=storage):
-        when = parse_datetime_from_name(name)
-        if when and now - when > INCOMPLETE_GRACE:
-            removed_incomplete.append(name)
-            if dry_run:
-                log.info(f"Would delete incomplete upload {name}")
-            else:
-                storage.delete_prefix(storage_key(conf.instance_id(), name))
-                log.info(f"Deleted incomplete upload {name}")
-    if not doomed and not removed_incomplete:
-        log.info(f"Retention: nothing to prune (retention {conf.get('retention')}, keep_last {conf.get('keep_last')})")
-    return [b.name for b in doomed] + removed_incomplete
-
-
-def parse_datetime_from_name(name):
-    stamp = name.split('-', 1)[0]
-    try:
-        return parse_datetime(f'{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}T{stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}Z')
-    except (ValueError, IndexError):
-        return None
+    for name, count, key in rules:
+        for set_id in _buckets(verified, count, key):
+            add(set_id, name)
+    qa = [c for c in ordered if c.qa_passed]
+    for c in qa[:retention.keep_min_verified]:
+        add(c.set_id, 'qa restore')
+    prune = [c.set_id for c in ordered if c.set_id not in keep]
+    return keep, prune

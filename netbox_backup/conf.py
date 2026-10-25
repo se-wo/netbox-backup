@@ -1,125 +1,97 @@
 """
-Typed access to the plugin's configuration (PLUGINS_CONFIG['netbox_backup']).
+The plugin's view of the static configuration in PLUGINS_CONFIG['netbox_backup'], plus the NetBox database as a
+core.pg.Database.
 """
-import hashlib
 import os
-import re
-from datetime import timedelta
+import tempfile
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
+from .core.config import Config, ConfigError
+from .core.pg import LIBPQ_OPTIONS, Database
+
 PLUGIN_NAME = 'netbox_backup'
 
-_UNITS = {
-    'm': 'minutes', 'min': 'minutes', 'mins': 'minutes', 'minute': 'minutes', 'minutes': 'minutes',
-    'h': 'hours', 'hr': 'hours', 'hour': 'hours', 'hours': 'hours',
-    'd': 'days', 'day': 'days', 'days': 'days',
-    'w': 'weeks', 'week': 'weeks', 'weeks': 'weeks',
-    'mo': 'months', 'month': 'months', 'months': 'months',
-    'y': 'years', 'year': 'years', 'years': 'years',
+# Sample secrets published in netbox-docker's env/netbox.env. An install running with them has forgeable sessions
+# and tokens, and so does every set taken from it.
+SAMPLE_SECRET_KEYS = {
+    'r(m)9nLGnz$(_q3N4z1k(EFsMCjjjzx08x9VhNVcfd%6RF#r!6DE@+V5Zk2X',
+}
+SAMPLE_PEPPERS = {
+    'Qy+F=OTeGskWQ(wTMgjc+NPPlz6YwFXY=KHIIg=wpYXT&e(6u8',
 }
 
+_cache = {}
 
-def get(key, default=None):
-    from . import NetBoxBackupConfig
-    plugin_config = getattr(settings, 'PLUGINS_CONFIG', {}).get(PLUGIN_NAME, {})
-    if key in plugin_config:
-        return plugin_config[key]
-    return NetBoxBackupConfig.default_settings.get(key, default)
+
+def raw():
+    return dict(getattr(settings, 'PLUGINS_CONFIG', {}).get(PLUGIN_NAME, {}) or {})
+
+
+def get_config():
+    """
+    The parsed Config. Re-parsed whenever PLUGINS_CONFIG changes (tests override it).
+    """
+    data = raw()
+    key = repr(sorted(data.items(), key=lambda kv: kv[0])) + settings.SECRET_KEY
+    if _cache.get('key') != key:
+        try:
+            _cache['config'] = Config.from_dict(data, fallback_instance_seed=settings.SECRET_KEY)
+        except ConfigError as e:
+            raise ImproperlyConfigured(f"netbox_backup: {e}") from e
+        _cache['key'] = key
+    return _cache['config']
 
 
 def instance_id():
+    return get_config().instance_id
+
+
+def database(alias='default', dbname=None):
     """
-    Identifier under which this installation's backups are stored. Two installations that share a bucket or
-    directory are kept apart by this value, and a restore refuses another instance's backups by default.
+    The NetBox database (or another database on the same server) as a core.pg.Database.
     """
-    value = get('instance_id')
-    if value:
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,62}', str(value)):
-            raise ImproperlyConfigured(
-                "netbox_backup: instance_id may contain only letters, digits, '.', '_' and '-' (max 63 chars)."
-            )
-        return str(value)
-    digest = hashlib.sha256(f'netbox-backup:{settings.SECRET_KEY}'.encode()).hexdigest()
-    return f'netbox-{digest[:12]}'
+    db = settings.DATABASES[alias]
+    params = {
+        'dbname': dbname or db.get('NAME'),
+        'user': db.get('USER') or None,
+        'host': db.get('HOST') or None,
+        'port': db.get('PORT') or None,
+        'application_name': 'netbox-backup',
+    }
+    for key, value in (db.get('OPTIONS') or {}).items():
+        if key in LIBPQ_OPTIONS and value is not None:
+            params[key] = value
+    config = get_config()
+    return Database(
+        params, password=db.get('PASSWORD') or None, pg_dump=config.pg_dump, pg_restore=config.pg_restore,
+        psql=config.psql,
+    )
 
 
-def parse_duration(value):
+def spool_dir(*parts):
     """
-    Parse a retention or interval value: an int (days), a timedelta, or a string such as "30 days", "2w", "1 month".
-    Months are treated as 30 days and years as 365 days.
+    Local spool for restores: an ephemeral volume. Created 0700.
     """
-    if value is None or value == '':
-        return None
-    if isinstance(value, timedelta):
-        return value
-    if isinstance(value, (int, float)):
-        return timedelta(days=value)
-    match = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([A-Za-z]+)\s*', str(value))
-    if not match:
-        raise ImproperlyConfigured(f"netbox_backup: cannot parse duration {value!r} (try e.g. '30 days').")
-    number, unit = float(match.group(1)), _UNITS.get(match.group(2).lower())
-    if unit is None:
-        raise ImproperlyConfigured(f"netbox_backup: unknown duration unit in {value!r}.")
-    if unit == 'months':
-        return timedelta(days=30 * number)
-    if unit == 'years':
-        return timedelta(days=365 * number)
-    return timedelta(**{unit: number})
-
-
-def retention():
-    return parse_duration(get('retention'))
-
-
-def interval(kind):
-    """
-    Schedule interval (minutes) for the given backup kind, or None if scheduling is disabled.
-    """
-    key = {'database': 'database_backup_interval', 'full': 'full_backup_interval'}[kind]
-    value = get(key)
-    if not value:
-        return None
-    if type(value) is not int or value < 1:
-        raise ImproperlyConfigured(f"netbox_backup: {key} must be a positive integer (minutes) or None.")
-    return value
-
-
-def stale_after():
-    """
-    Age after which the newest successful backup is considered stale.
-    """
-    value = get('stale_after')
-    if value:
-        return timedelta(minutes=value)
-    intervals = [i for i in (interval('database'), interval('full')) if i]
-    if not intervals:
-        return None
-    return timedelta(minutes=2 * min(intervals))
-
-
-def encryption_key():
-    return get('encryption_key') or None
-
-
-def include_configuration():
-    value = get('include_configuration')
-    if value == 'auto':
-        return bool(encryption_key())
-    return bool(value)
-
-
-def work_dir():
-    path = get('work_dir')
-    if path:
-        os.makedirs(path, mode=0o700, exist_ok=True)
+    base = get_config().spool_dir or os.path.join(tempfile.gettempdir(), 'netbox-backup')
+    path = os.path.join(base, *parts)
+    os.makedirs(path, mode=0o700, exist_ok=True)
     return path
 
 
-def storage_config():
-    cfg = dict(get('storage') or {})
-    cfg.setdefault('backend', 'local')
-    if cfg['backend'] == 'local' and not cfg.get('path'):
-        cfg['path'] = os.path.join(os.path.dirname(settings.BASE_DIR), 'backups')
-    return cfg
+def startup_problems():
+    """
+    Configuration mistakes reported by health checks: sample secrets and unparsable configuration.
+    """
+    problems = []
+    if settings.SECRET_KEY in SAMPLE_SECRET_KEYS:
+        problems.append("SECRET_KEY is netbox-docker's published sample; generate a new one")
+    peppers = getattr(settings, 'API_TOKEN_PEPPERS', None) or {}
+    if any(str(p) in SAMPLE_PEPPERS for p in peppers.values()):
+        problems.append("API_TOKEN_PEPPERS contains netbox-docker's published sample; generate a new one")
+    try:
+        get_config()
+    except ImproperlyConfigured as e:
+        problems.append(str(e))
+    return problems

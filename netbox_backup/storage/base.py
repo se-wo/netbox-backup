@@ -130,7 +130,8 @@ class StorageBackend:
 
     @staticmethod
     def join(*parts):
-        return posixpath.join(*[str(p).strip('/') for p in parts if p])
+        parts = [str(p).strip('/') for p in parts if p]
+        return posixpath.join(*parts) if parts else ''
 
     def full_key(self, key):
         key = str(key).lstrip('/')

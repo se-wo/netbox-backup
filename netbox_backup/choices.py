@@ -2,85 +2,124 @@ from django.utils.translation import gettext_lazy as _
 from utilities.choices import ChoiceSet
 
 
-class BackupKindChoices(ChoiceSet):
-    KIND_DATABASE = 'database'
-    KIND_FULL = 'full'
+class ComponentChoices(ChoiceSet):
+    DATABASE = 'database'
+    MEDIA = 'media'
+    SCRIPTS = 'scripts'
+    CONFIG = 'config'
 
     CHOICES = (
-        (KIND_DATABASE, _('Database'), 'blue'),
-        (KIND_FULL, _('Full'), 'purple'),
+        (DATABASE, _('Database')),
+        (MEDIA, _('Media')),
+        (SCRIPTS, _('Scripts')),
+        (CONFIG, _('Configuration')),
     )
 
 
-class BackupStatusChoices(ChoiceSet):
-    STATUS_PENDING = 'pending'
-    STATUS_RUNNING = 'running'
-    STATUS_COMPLETED = 'completed'
-    STATUS_WARNING = 'warning'
-    STATUS_FAILED = 'failed'
-    STATUS_MISSING = 'missing'
+class SetStatusChoices(ChoiceSet):
+    """
+    pending -> running -> uploaded -> verified, with exits to failed, partial (primary ok, a replica failed) and
+    expired (pruned; the row is kept 90 days for audit).
+    """
+    PENDING = 'pending'
+    RUNNING = 'running'
+    UPLOADED = 'uploaded'
+    VERIFIED = 'verified'
+    PARTIAL = 'partial'
+    FAILED = 'failed'
+    EXPIRED = 'expired'
 
-    SUCCESSFUL = (STATUS_COMPLETED, STATUS_WARNING)
+    USABLE = (UPLOADED, VERIFIED, PARTIAL)
+    ACTIVE = (PENDING, RUNNING)
 
     CHOICES = (
-        (STATUS_PENDING, _('Pending'), 'cyan'),
-        (STATUS_RUNNING, _('Running'), 'blue'),
-        (STATUS_COMPLETED, _('Completed'), 'green'),
-        (STATUS_WARNING, _('Completed with warnings'), 'yellow'),
-        (STATUS_FAILED, _('Failed'), 'red'),
-        (STATUS_MISSING, _('Missing from storage'), 'gray'),
+        (PENDING, _('Pending'), 'cyan'),
+        (RUNNING, _('Running'), 'blue'),
+        (UPLOADED, _('Uploaded'), 'teal'),
+        (VERIFIED, _('Verified'), 'green'),
+        (PARTIAL, _('Partial'), 'yellow'),
+        (FAILED, _('Failed'), 'red'),
+        (EXPIRED, _('Expired'), 'gray'),
     )
 
 
-class BackupTriggerChoices(ChoiceSet):
-    TRIGGER_SCHEDULED = 'scheduled'
-    TRIGGER_MANUAL = 'manual'
-    TRIGGER_API = 'api'
-    TRIGGER_CLI = 'cli'
-    TRIGGER_PRE_RESTORE = 'pre-restore'
+class TriggerChoices(ChoiceSet):
+    SCHEDULED = 'scheduled'
+    MANUAL = 'manual'
+    API = 'api'
+    CLI = 'cli'
+    PRE_UPGRADE = 'pre-upgrade'
+    SAFETY = 'safety'
+    POST_RESTORE = 'post-restore'
 
     CHOICES = (
-        (TRIGGER_SCHEDULED, _('Scheduled')),
-        (TRIGGER_MANUAL, _('Manual (UI)')),
-        (TRIGGER_API, _('REST API')),
-        (TRIGGER_CLI, _('Command line')),
-        (TRIGGER_PRE_RESTORE, _('Pre-restore safety backup')),
+        (SCHEDULED, _('Scheduled')),
+        (MANUAL, _('Manual (UI)')),
+        (API, _('REST API')),
+        (CLI, _('Command line')),
+        (PRE_UPGRADE, _('Pre-upgrade')),
+        (SAFETY, _('Restore safety set')),
+        (POST_RESTORE, _('After restore')),
     )
 
 
-class VerificationStatusChoices(ChoiceSet):
-    STATUS_UNVERIFIED = 'unverified'
-    STATUS_PASSED = 'passed'
-    STATUS_FAILED = 'failed'
+class CopyStatusChoices(ChoiceSet):
+    PENDING = 'pending'
+    UPLOADING = 'uploading'
+    UPLOADED = 'uploaded'
+    VERIFIED = 'verified'
+    FAILED = 'failed'
+    DELETED = 'deleted'
 
     CHOICES = (
-        (STATUS_UNVERIFIED, _('Unverified'), 'gray'),
-        (STATUS_PASSED, _('Passed'), 'green'),
-        (STATUS_FAILED, _('Failed'), 'red'),
+        (PENDING, _('Pending'), 'cyan'),
+        (UPLOADING, _('Uploading'), 'blue'),
+        (UPLOADED, _('Uploaded'), 'teal'),
+        (VERIFIED, _('Verified'), 'green'),
+        (FAILED, _('Failed'), 'red'),
+        (DELETED, _('Deleted'), 'gray'),
     )
 
 
-class VerificationLevelChoices(ChoiceSet):
-    LEVEL_QUICK = 'quick'
-    LEVEL_DEEP = 'deep'
-    LEVEL_RESTORE = 'restore'
+class VerifyLevelChoices(ChoiceSet):
+    NONE = 0
+    INTEGRITY = 1
+    QA_RESTORE = 2
 
     CHOICES = (
-        (LEVEL_QUICK, _('Quick (storage presence and sizes)')),
-        (LEVEL_DEEP, _('Deep (download, decrypt, checksums, archive contents)')),
-        (LEVEL_RESTORE, _('Test restore (deep + restore into a scratch database and compare row counts)')),
+        (NONE, _('Not verified'), 'gray'),
+        (INTEGRITY, _('Level 1: integrity'), 'green'),
+        (QA_RESTORE, _('Level 2: QA restore'), 'purple'),
     )
 
 
 class RestoreStatusChoices(ChoiceSet):
-    STATUS_COMPLETED = 'completed'
-    STATUS_WARNING = 'warning'
-    STATUS_RECOVERY_REQUIRED = 'recovery-required'
-    STATUS_FAILED = 'failed'
+    PLANNED = 'planned'
+    LOADING = 'loading'
+    LOADED = 'loaded'
+    FINISHING = 'finishing'
+    FINISHED = 'finished'
+    ROLLED_BACK = 'rolled-back'
+    FINALIZED = 'finalized'
+    FAILED = 'failed'
 
     CHOICES = (
-        (STATUS_COMPLETED, _('Completed'), 'green'),
-        (STATUS_WARNING, _('Completed with warnings'), 'yellow'),
-        (STATUS_RECOVERY_REQUIRED, _('Recovery required'), 'orange'),
-        (STATUS_FAILED, _('Failed'), 'red'),
+        (PLANNED, _('Planned'), 'cyan'),
+        (LOADING, _('Loading'), 'blue'),
+        (LOADED, _('Loaded, awaiting switch'), 'yellow'),
+        (FINISHING, _('Finishing'), 'blue'),
+        (FINISHED, _('Finished'), 'green'),
+        (ROLLED_BACK, _('Rolled back'), 'orange'),
+        (FINALIZED, _('Finalized'), 'gray'),
+        (FAILED, _('Failed'), 'red'),
+    )
+
+
+class RestoreStrategyChoices(ChoiceSet):
+    SLOT = 'slot'
+    IN_PLACE = 'in-place'
+
+    CHOICES = (
+        (SLOT, _('Restore slot')),
+        (IN_PLACE, _('In place')),
     )

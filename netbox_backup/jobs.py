@@ -1,105 +1,64 @@
+"""
+Background jobs. Long jobs run on the dedicated queue netbox_backup.netbox_backup, served by its own rqworker, so
+they never block scripts or webhooks. Each BackupJob uses its BackupPolicy as the job's object and stores the set
+status in the job data, so an event rule on "Job completed" for BackupPolicy can alert on it.
+"""
 from core.exceptions import JobFailed
 from netbox.jobs import JobRunner, system_job
 
-from . import conf
-from .choices import BackupKindChoices, BackupTriggerChoices, VerificationLevelChoices
-from .engine import catalog, retention
-from .engine.backup import BackupInProgress, create_backup
-from .engine.verify import verify_backup
+from .choices import TriggerChoices
+
+QUEUE = 'netbox_backup.netbox_backup'
 
 
 class BackupJob(JobRunner):
-    """
-    Create a backup on demand (UI, REST API).
-    """
     class Meta:
         name = 'Backup'
 
-    def run(self, kind=BackupKindChoices.KIND_DATABASE, trigger=BackupTriggerChoices.TRIGGER_MANUAL,
-            requested_by='', verify_level=None, **kwargs):
+    def run(self, policy, trigger=TriggerChoices.SCHEDULED, created_by='', components=None, **kwargs):
+        from .engine.backup import run_backup
+        from .engine.locks import LockHeld
         try:
-            backup = create_backup(kind=kind, trigger=trigger, requested_by=requested_by, job=self.job,
-                                   log=self.logger)
-        except BackupInProgress as e:
+            run_backup(policy, trigger=trigger, created_by=created_by, job=self.job, log=self.logger,
+                       components=components)
+        except LockHeld as e:
             self.logger.error(str(e))
-            raise JobFailed()
-        self.job.data = {'backup': backup.name, 'backup_id': backup.pk, 'status': backup.status, 'size': backup.size}
-        if verify_level:
-            passed, _ = verify_backup(backup, level=verify_level, log=self.logger)
-            if not passed:
-                raise JobFailed()
-        retention.prune(log=self.logger)
+            raise JobFailed() from e
+        PruneJob.enqueue(queue_name=QUEUE)
 
 
-class VerifyBackupJob(JobRunner):
+class VerifyJob(JobRunner):
     class Meta:
         name = 'Backup verification'
 
-    def run(self, backup_id, level=VerificationLevelChoices.LEVEL_DEEP, **kwargs):
-        from .models import Backup
-        backup = Backup.objects.get(pk=backup_id)
-        passed, results = verify_backup(backup, level=level, log=self.logger)
-        self.job.data = {'backup': backup.name, 'backup_id': backup.pk, 'level': level, 'passed': passed,
-                         'results': results}
-        if not passed:
+    def run(self, set_id, **kwargs):
+        from .engine.verify import verify_set
+        ok = verify_set(set_id, log=self.logger)
+        self.job.data = {'set_id': set_id, 'passed': ok}
+        if not ok:
             raise JobFailed()
 
 
-class _ScheduledBackupJob(JobRunner):
-    kind = None
+class PruneJob(JobRunner):
+    class Meta:
+        name = 'Backup prune'
+
+    def run(self, dry_run=False, **kwargs):
+        from .engine.prune import prune
+        reports = prune(dry_run=dry_run, log=self.logger)
+        self.job.data = {'targets': [r.as_dict() for r in reports]}
+        if any(r.errors for r in reports):
+            for report in reports:
+                for error in report.errors:
+                    self.logger.error(f"{report.target}: {error}")
+            raise JobFailed()
+
+
+@system_job(interval=5)
+class SchedulerJob(JobRunner):
+    class Meta:
+        name = 'Backup scheduler'
 
     def run(self, *args, **kwargs):
-        configured = conf.interval(self.kind)
-        if configured != self.job.interval:
-            # The schedule was changed or disabled since this job was queued; stop this recurrence. The worker
-            # schedules the new interval (if any) when it next starts.
-            self.logger.warning(f"{self.kind} backup schedule changed to {configured}; not rescheduling")
-            self.job.interval = None
-            return
-        try:
-            create_backup(kind=self.kind, trigger=BackupTriggerChoices.TRIGGER_SCHEDULED, job=self.job,
-                          log=self.logger)
-        except BackupInProgress as e:
-            self.logger.warning(f"Skipped: {e}")
-            return
-        retention.prune(log=self.logger)
-
-
-class ScheduledDatabaseBackupJob(_ScheduledBackupJob):
-    kind = BackupKindChoices.KIND_DATABASE
-
-    class Meta:
-        name = 'Scheduled database backup'
-
-
-class ScheduledFullBackupJob(_ScheduledBackupJob):
-    kind = BackupKindChoices.KIND_FULL
-
-    class Meta:
-        name = 'Scheduled full backup'
-
-
-class BackupHousekeepingJob(JobRunner):
-    """
-    Reconcile the catalog with storage, apply retention, remove scratch databases from interrupted test restores.
-    """
-    class Meta:
-        name = 'Backup housekeeping'
-
-    def run(self, *args, **kwargs):
-        from .engine.verify import cleanup_scratch_databases
-        catalog.sync(log=self.logger)
-        retention.prune(log=self.logger)
-        try:
-            cleanup_scratch_databases()
-        except Exception as e:
-            self.logger.warning(f"Could not clean up scratch databases: {e}")
-
-
-def register_system_jobs():
-    for kind, cls in ((BackupKindChoices.KIND_DATABASE, ScheduledDatabaseBackupJob),
-                      (BackupKindChoices.KIND_FULL, ScheduledFullBackupJob)):
-        if interval := conf.interval(kind):
-            system_job(interval=interval)(cls)
-    if interval := conf.get('housekeeping_interval'):
-        system_job(interval=int(interval))(BackupHousekeepingJob)
+        from .engine.scheduler import tick
+        tick(log=self.logger)
