@@ -126,6 +126,13 @@ Install it and run `migrate`.
 Stop `netbox` (gunicorn/uwsgi), `netbox-rq` and any housekeeping cron, then retry. Or pass
 `--terminate-connections` if you are certain nothing else should be using the database.
 
+### `unrecognized configuration parameter "transaction_timeout"`
+
+`pg_restore` 17 and later emit `SET transaction_timeout`, which PostgreSQL 16 and older reject. The plugin detects
+a newer `pg_restore` than the server and restores through `psql` with that statement removed. It needs `psql`
+on the host (it ships in the same client package; set `'psql'` if it is not on `PATH`). This path restores with
+a single job, so `--jobs` has no effect there. Using client tools that match the server's major version avoids it.
+
 ### `pg_restore exited with status 1: ... must be owner of extension/schema`
 
 The NetBox role cannot recreate the schema. Either grant it ownership of the database (`ALTER DATABASE netbox

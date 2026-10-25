@@ -304,3 +304,45 @@ class HealthTest(EngineTestBase):
         self.configure(storage={'backend': 'local', 'path': '/proc/forbidden'})
         conds = {c.name: c for c in health.conditions()}
         self.assertEqual(conds['StorageReachable'].status, health.ERROR)
+
+
+class NewerClientRestoreTest(EngineTestBase):
+    """
+    pg_restore 17+ emits SET transaction_timeout, which PostgreSQL < 17 rejects. Restores then go through psql
+    with that statement stripped. Exercise that path against whatever server the suite runs on.
+    """
+
+    def test_strip_decision(self):
+        from netbox_backup.engine import pg
+        self.assertEqual(pg.settings_to_strip(server_major=14, client_major=17), {'transaction_timeout'})
+        self.assertEqual(pg.settings_to_strip(server_major=17, client_major=17), set())
+        self.assertEqual(pg.settings_to_strip(server_major=14, client_major=16), set())
+
+    def test_filter(self):
+        from netbox_backup.engine import pg
+        unsupported = pg.unsupported_setting_filter({'transaction_timeout'})
+        self.assertTrue(unsupported(b'SET transaction_timeout = 0;\n'))
+        self.assertFalse(unsupported(b'SET statement_timeout = 0;\n'))
+        self.assertFalse(unsupported(b"INSERT INTO t VALUES ('SET transaction_timeout = 0');\n"))
+
+    def test_restore_and_test_restore_via_psql(self):
+        # lock_timeout is something every pg_restore emits, so stripping it proves the filter runs on real output
+        with mock.patch('netbox_backup.engine.pg.settings_to_strip', return_value={'lock_timeout'}), \
+                mock.patch('netbox_backup.engine.pg.restore_via_psql', wraps=__import__(
+                    'netbox_backup.engine.pg', fromlist=['restore_via_psql']).restore_via_psql) as via_psql:
+            backup = create_backup(kind='database', trigger='cli')
+            passed, results = verify_backup(backup, level='restore')
+            self.assertTrue(passed, results)
+            Site.objects.create(name='After', slug='after')
+            event = restore.restore_backup(catalog.resolve(backup.name), safety_backup=False)
+        self.assertEqual(via_psql.call_count, 2)
+        self.assertEqual(event.status, RestoreStatusChoices.STATUS_COMPLETED, event.log)
+        self.assertFalse(Site.objects.filter(slug='after').exists())
+
+    def test_psql_errors_are_reported(self):
+        from netbox_backup.engine import pg
+        backup = create_backup(kind='database', trigger='cli')
+        path = os.path.join(self.storage_path, backup.instance_id, backup.name, 'database.dump')
+        # Restoring over existing tables fails on the first CREATE TABLE; ON_ERROR_STOP must surface it
+        with self.assertRaisesRegex(pg.PostgresError, 'psql exited'):
+            pg.restore_via_psql(path, strip={'transaction_timeout'})

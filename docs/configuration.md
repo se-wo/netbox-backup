@@ -19,6 +19,7 @@ All settings live under `PLUGINS_CONFIG['netbox_backup']` in `configuration.py`.
 | `housekeeping_interval` | `60` | Minutes between catalog sync, retention pruning and scratch-DB cleanup. |
 | `work_dir` | system temp dir | Scratch space while building or restoring. Needs room for the dump plus archives. |
 | `pg_dump` / `pg_restore` | `'pg_dump'` / `'pg_restore'` | Client binaries, e.g. `'/usr/lib/postgresql/16/bin/pg_dump'`. |
+| `psql` | `'psql'` | Used only when `pg_restore` is newer than the server (see troubleshooting). |
 | `pg_dump_extra_args` | `[]` | Extra `pg_dump` arguments, e.g. `['--compress=zstd:3']` (PG 16+). |
 | `compression_level` | `6` | gzip level for file archives. |
 | `pgbackrest` | `None` | Monitor an external pgBackRest stanza: `{'stanza': 'netbox', 'max_age': '8 days', 'binary': 'pgbackrest', 'config': None}`. |

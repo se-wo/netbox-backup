@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 import psycopg
 from django.conf import settings
@@ -170,12 +171,74 @@ def dump_toc(path):
     return entries
 
 
+# Settings pg_restore emits unconditionally but older servers reject, keyed by the first server major version
+# that understands them. pg_restore 17+ sets transaction_timeout, which only exists from PostgreSQL 17.
+UNSUPPORTED_SETTINGS = {'transaction_timeout': 17}
+
+
+def settings_to_strip(server_major, client_major):
+    return {name for name, since in UNSUPPORTED_SETTINGS.items() if client_major >= since > server_major}
+
+
 def restore(path, dbname=None, jobs=1, logger=None):
+    with connect(dbname=dbname) as conn:
+        server_major = server_version(conn) // 10000
+    strip = settings_to_strip(server_major, client_major_version('pg_restore') or 0)
+    if strip:
+        restore_via_psql(path, dbname=dbname, strip=strip, logger=logger)
+        return
     args = [
         binary('pg_restore'), '--no-password', '--exit-on-error', '--no-owner', '--no-privileges',
         f'--jobs={jobs}', f'--dbname={conninfo(dbname=dbname)}', path,
     ]
     run(args, logger=logger)
+
+
+def unsupported_setting_filter(strip):
+    """
+    Return a predicate that is True for SQL lines setting one of the named parameters.
+    """
+    pattern = re.compile(rb'^SET (%s) = ' % b'|'.join(re.escape(s.encode()) for s in sorted(strip)))
+    return lambda line: bool(pattern.match(line))
+
+
+def restore_via_psql(path, dbname=None, strip=(), logger=None):
+    """
+    Render the dump to SQL with pg_restore, drop SET statements for settings the target server does not know, and
+    stream the rest into psql. Used when the client tools are newer than the server; single-job only.
+    """
+    if logger:
+        logger.info(f"pg_restore is newer than the server; restoring through psql without {', '.join(sorted(strip))}")
+    unsupported = unsupported_setting_filter(strip)
+    with tempfile.TemporaryFile() as producer_err, tempfile.TemporaryFile() as consumer_err:
+        producer = subprocess.Popen(
+            [binary('pg_restore'), '--no-owner', '--no-privileges', '--file=-', path],
+            stdout=subprocess.PIPE, stderr=producer_err, env=subprocess_env(),
+        )
+        consumer = subprocess.Popen(
+            [binary('psql'), '--no-password', '--no-psqlrc', '--quiet', '--set=ON_ERROR_STOP=1',
+             '--output=/dev/null', f'--dbname={conninfo(dbname=dbname)}'],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=consumer_err, env=subprocess_env(),
+        )
+        try:
+            for line in producer.stdout:
+                if not unsupported(line):
+                    consumer.stdin.write(line)
+            consumer.stdin.close()
+        except BrokenPipeError:
+            pass  # psql stopped on an error; reported below
+        finally:
+            with contextlib.suppress(BrokenPipeError):
+                consumer.stdin.close()
+            producer.stdout.close()
+            if consumer.wait() != 0:
+                producer.kill()
+            producer.wait()
+        for proc, err, name in ((consumer, consumer_err, 'psql'), (producer, producer_err, 'pg_restore')):
+            if proc.returncode != 0:
+                err.seek(0)
+                message = err.read().decode(errors='replace').strip()
+                raise PostgresError(f"{name} exited with status {proc.returncode}: {message}")
 
 
 def other_connections(conn):
