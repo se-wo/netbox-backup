@@ -21,7 +21,7 @@ from netbox_backup.engine.restore import RestoreError, Restorer, build_plan, ini
 from netbox_backup.models import BackupSet, RestoreRun
 
 from .test_backup import MediaMixin
-from .utils import PluginConfigMixin
+from .utils import PluginConfigMixin, drop_database
 
 SLOT = 'test_netbox_nbb_slot'
 
@@ -130,7 +130,7 @@ class SlotRestoreTest(RestoreTestBase):
     def setUp(self):
         super().setUp()
         with admin() as c:
-            c.execute(f'DROP DATABASE IF EXISTS {SLOT}')
+            drop_database(c, SLOT)
             c.execute(f'CREATE DATABASE {SLOT} OWNER {conf.database().params["user"]}')
         self.configure(databases=[self.live(), SLOT])
         self.original_name = self.live()
@@ -140,7 +140,7 @@ class SlotRestoreTest(RestoreTestBase):
         settings.DATABASES['default']['NAME'] = self.original_name
         connection.settings_dict['NAME'] = self.original_name
         with admin() as c:
-            c.execute(f'DROP DATABASE IF EXISTS {SLOT} WITH (FORCE)')
+            drop_database(c, SLOT)
         super().tearDown()
 
     def switch(self, name):

@@ -1,12 +1,30 @@
 import shutil
 import tempfile
+import time
 
+import psycopg
 from django.conf import settings
 from django.test import override_settings
 
 from .test_core import KeyMaterial
 
 INSTANCE_ID = '0b1d3c5e-7f90-4a1b-8c2d-3e4f5a6b7c8d'
+
+
+def drop_database(admin, name, wait=30.0):
+    """
+    DROP DATABASE ... WITH (FORCE) for a test database. As the non-superuser CI role, FORCE can't terminate an
+    autovacuum worker that just started on a freshly loaded database, so retry until it has finished.
+    """
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            admin.execute(f'DROP DATABASE IF EXISTS {name} WITH (FORCE)')
+            return
+        except (psycopg.errors.InsufficientPrivilege, psycopg.errors.ObjectInUse):
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.5)
 
 
 class PluginConfigMixin:

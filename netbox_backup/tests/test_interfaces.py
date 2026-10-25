@@ -21,7 +21,7 @@ from netbox_backup.engine.backup import run_backup
 from netbox_backup.models import BackupPolicy, BackupSet, StorageTarget
 
 from .test_backup import MediaMixin
-from .utils import PluginConfigMixin
+from .utils import PluginConfigMixin, drop_database
 
 EXTRA_DB = 'test_netbox_nbb_cli'
 
@@ -191,7 +191,7 @@ class InterfaceTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
     def test_standalone_restore_db(self):
         db = conf.database()
         admin = psycopg.connect(password=db.password, autocommit=True, **{**db.params, 'dbname': 'postgres'})
-        admin.execute(f'DROP DATABASE IF EXISTS {EXTRA_DB}')
+        drop_database(admin, EXTRA_DB)
         admin.execute(f'CREATE DATABASE {EXTRA_DB}')
         dsn = f"postgresql://{db.params['user']}@{db.params.get('host', 'localhost')}/{EXTRA_DB}"
         os.environ['PGPASSWORD'] = db.password
@@ -209,7 +209,7 @@ class InterfaceTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
             self.assertIn(loaded.restore_id, out)
         finally:
             os.environ.pop('PGPASSWORD', None)
-            admin.execute(f'DROP DATABASE IF EXISTS {EXTRA_DB} WITH (FORCE)')
+            drop_database(admin, EXTRA_DB)
             admin.close()
 
     def test_static_mirror_disables_removed_policies(self):
