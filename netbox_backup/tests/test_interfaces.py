@@ -166,9 +166,9 @@ class InterfaceTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
         code, out = self.run_cli('verify', '--deep', 'latest')
         self.assertEqual(code, 0, out)
         self.assertIn('db.pgdump.enc: decrypt', out)
+        self.assertIn('[SKIP] config.json.enc: decrypt', out)  # the ops key can't read the secrets
         code, out = self.run_cli('check', '--max-age', '1h')
         self.assertEqual(code, 0, out)
-        self.assertIn('[SKIP] config.json.enc: decrypt', out)  # the ops key can't read the secrets
         code, out = self.run_cli('decrypt', 'latest', '--out', os.path.join(self.tmp, 'plain'))
         self.assertEqual(code, 0, out)
         self.assertIn('config: skipped', out)

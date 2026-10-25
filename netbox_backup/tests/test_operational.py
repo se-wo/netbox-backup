@@ -124,8 +124,9 @@ class OverrunTest(PluginConfigMixin, TransactionTestCase):
     def test_tick_frees_the_lock_of_a_hung_job(self):
         catalog.sync_static()
         policy = BackupPolicy.objects.get()
-        stuck = BackupSet.objects.create(set_id=layout.new_ulid(), instance_id='x', policy=policy, trigger='cli',
-                                         status=SetStatusChoices.RUNNING, started=timezone.now() - timedelta(hours=2))
+        stuck = BackupSet.objects.create(set_id=layout.new_ulid(), instance_id='x', policy=policy,
+                                         policy_name='default', trigger='cli', status=SetStatusChoices.RUNNING,
+                                         started=timezone.now() - timedelta(hours=2))
         hung = locks.connect()
         self.addCleanup(hung.close)
         self.assertTrue(locks.try_lock(hung, 'policy:default'))
