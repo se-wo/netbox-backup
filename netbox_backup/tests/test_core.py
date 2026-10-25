@@ -404,7 +404,7 @@ class SetFormatTest(unittest.TestCase):
         with Keyring(KeyMaterial.crypto(), signing=True) as keyring:
             set_id, _ = self.write_set(keyring)
             loaded = sets.load_manifest(self.backend, self.instance, set_id)
-            loaded.body_ciphertext = loaded.body_ciphertext[:-1] + b'\x00'
+            loaded.body_ciphertext = loaded.body_ciphertext[:-1] + bytes([loaded.body_ciphertext[-1] ^ 0xff])
             with self.assertRaisesRegex(manifest.ManifestError, 'body'):
                 manifest.verify(loaded, keyring)
 
@@ -414,9 +414,11 @@ class SetFormatTest(unittest.TestCase):
         loaded = sets.load_manifest(self.backend, self.instance, set_id)
         path = os.path.join(self.root, layout.object_key(self.instance, set_id, 'db.pgdump.enc'))
         os.chmod(path, 0o600)
-        with open(path, 'r+b') as f:
+        with open(path, 'r+b') as f:  # flip the byte: writing a constant is a no-op when it already holds it
             f.seek(100)
-            f.write(b'\xff')
+            byte = f.read(1)
+            f.seek(100)
+            f.write(bytes([byte[0] ^ 0xff]))
         spool = os.path.join(self.root, 'spool')
         with Keyring(KeyMaterial.crypto(), identities=True) as keyring:
             with self.assertRaisesRegex(sets.SetError, 'SHA-384'):
