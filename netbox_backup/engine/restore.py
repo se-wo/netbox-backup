@@ -32,6 +32,7 @@ from ..choices import RestoreStrategyChoices, SetStatusChoices, TriggerChoices, 
 from ..core import layout, sets
 from ..core import manifest as manifest_mod
 from ..core import pg as pgcore
+from ..core import secrets as secrets_mod
 from ..core.gpg import GPGError, Keyring
 from ..storage import StorageError, get_backend
 from . import journal as journal_mod
@@ -114,6 +115,10 @@ def locate(config, set_ref, target=None, from_instance=None):
     Find a complete set on the given target, or on the first target that holds it.
     """
     instance_id = from_instance or config.instance_id
+    if instance_id is None:
+        raise RestoreError("instance_id is not pinned and this database records none: pin instance_id in "
+                           "PLUGINS_CONFIG, or pass --from-instance (list instances with: nbbackup list "
+                           "--all-instances)")
     names = [target] if target else list(config.targets)
     errors = []
     for name in names:
@@ -145,6 +150,46 @@ def migration_state(applied):
     pending = {f'{a}.{n}' for a, n in loader.graph.nodes
                if f'{a}.{n}' not in applied and not (f'{a}.{n}' in replaces and replaces[f'{a}.{n}'] <= applied)}
     return unknown, pending, {k.split('.', 1)[0] for k in known}
+
+
+UNFINISHED = ('planned', 'loading', 'loaded', 'finishing', 'failed')
+
+
+def unfinished_journals(database):
+    """
+    Restores that loaded (or started loading) into this database and were neither finished, rolled back nor
+    superseded. Newest first.
+    """
+    return [j for j in journal_mod.list_journals()
+            if j['status'] in UNFINISHED and j.get('slot_database') == database
+            and j['strategy'] in (RestoreStrategyChoices.IN_PLACE, RestoreStrategyChoices.SLOT)]
+
+
+def dr_state(config, live=None):
+    """
+    Whether the live database counts as empty, which allows an in-place load without --confirm and without a
+    safety set (disaster-recovery mode). Empty means all of: no relations in any non-system schema, no extension but
+    plpgsql, no slot marker on it, no unfinished restore journal for it, and the other configured database (if a
+    slot pair is configured) empty as well. Returns (empty, reasons it isn't, {database: newest change}).
+    """
+    live = live or live_database_name()
+    reasons, newest = [], {}
+    for name in [live] + [d for d in config.databases if d != live]:
+        try:
+            with conf.database(dbname=name).connect() as conn, conn.cursor() as cursor:
+                if not pgcore.is_empty(conn):
+                    reasons.append(f"{name} holds relations or extensions")
+                    newest[name] = pgcore.newest_change(cursor)
+                else:
+                    newest[name] = None
+                if name == live and pgcore.has_slot_marker(conn, name):
+                    reasons.append(f"{name} carries the slot marker: it is a restore slot, not a live database")
+        except Exception as e:
+            reasons.append(f"{name} cannot be inspected ({e})")
+            newest[name] = None
+    for j in unfinished_journals(live):
+        reasons.append(f"restore {j.restore_id} into {live} is unfinished ({j['status']})")
+    return not reasons, reasons, newest
 
 
 def _live_state(db):
@@ -283,7 +328,13 @@ def _plan_compatibility(plan, config):
 
 def _plan_strategy(plan, config, headroom_confirmed):
     live_db = conf.database()
-    empty, newest, owned, capacity = _live_state(live_db)
+    _, newest, owned, capacity = _live_state(live_db)
+    empty, not_empty, _ = dr_state(config, plan.live_database)
+    rerun = next(iter(unfinished_journals(plan.live_database)), None)
+    if rerun is not None and rerun['strategy'] == RestoreStrategyChoices.IN_PLACE:
+        plan.check('Journal', WARN, f"restore {rerun.restore_id} into {plan.live_database} is unfinished "
+                                    f"({rerun['status']}); an in-place load reuses its safety set "
+                                    f"{rerun.get('safety_set_id') or '(it had none; none will be taken)'}")
     set_newest = (plan.body or {}).get('baseline', {}).get('newest_last_updated')
     if newest and set_newest:
         delta = parse_datetime(newest) - parse_datetime(set_newest)
@@ -294,7 +345,11 @@ def _plan_strategy(plan, config, headroom_confirmed):
     if plan.slot_database:
         slot_usable, slot_reason = _check_slot(plan, config, report=False)
     if empty:
-        plan.strategy, plan.reason = RestoreStrategyChoices.IN_PLACE, 'the live database is empty: nothing to protect'
+        plan.strategy = RestoreStrategyChoices.IN_PLACE
+        plan.reason = 'the live database is empty (disaster-recovery mode): nothing to protect'
+    elif rerun is not None and rerun['strategy'] == RestoreStrategyChoices.IN_PLACE:
+        plan.strategy = RestoreStrategyChoices.IN_PLACE
+        plan.reason = f"restore {rerun.restore_id} left {plan.live_database} unfinished; rerun it in place"
     elif slot_usable:
         plan.strategy = RestoreStrategyChoices.SLOT
         plan.reason = f"restore slot {plan.slot_database} is ready; the live database stays untouched"
@@ -379,9 +434,32 @@ def _check_redis(plan):
                                   "config cache keys")
 
 
+def _safety_size_estimate():
+    """
+    Size of the safety set an in-place load keeps on the spool: the newest set of this install, else the live
+    database's size on disk.
+    """
+    try:
+        from ..models import BackupSet
+        newest = BackupSet.objects.filter(status__in=SetStatusChoices.USABLE, size_bytes__isnull=False) \
+            .order_by('-finished').values_list('size_bytes', flat=True).first()
+        if newest:
+            return newest
+    except Exception:
+        pass
+    try:
+        with conf.database().connect() as conn, conn.cursor() as cursor:
+            cursor.execute('SELECT pg_database_size(current_database())')
+            return cursor.fetchone()[0]
+    except Exception:
+        return 0
+
+
 def _check_space(plan, headroom_confirmed):
     free = shutil.disk_usage(conf.spool_dir()).free
     needed = int(plan.size_bytes * 3)
+    if plan.strategy == RestoreStrategyChoices.IN_PLACE and not plan.reason.startswith('the live database is empty'):
+        needed += _safety_size_estimate()  # the local copy of the safety set stays until finalize
     if free < needed:
         plan.check('Space', ABORT, f"spool {conf.spool_dir()} has {free} bytes free, needs about {needed}")
     elif plan.strategy == RestoreStrategyChoices.SLOT and not headroom_confirmed:
@@ -468,11 +546,16 @@ class Restorer:
             if not plan.ok:
                 raise RestoreError('Preflight failed: ' + '; '.join(f"{c['check']}: {c['detail']}"
                                                                     for c in plan.aborts))
-            if strategy == RestoreStrategyChoices.IN_PLACE and confirm != plan.live_database:
-                empty, *_ = _live_state(conf.database())
-                if not empty:
-                    raise RestoreError(f"In-place restore replaces {plan.live_database}: pass --confirm "
-                                       f"{plan.live_database}")
+            empty, not_empty, newest = dr_state(self.config, plan.live_database)
+            rerun = next(iter(unfinished_journals(plan.live_database)), None)
+            if strategy == RestoreStrategyChoices.IN_PLACE and confirm != plan.live_database and not empty:
+                changes = '; '.join(f"{db}: newest change {ts.isoformat() if ts else 'none'}"
+                                    for db, ts in newest.items())
+                raise RestoreError(f"In-place restore replaces {plan.live_database} ({'; '.join(not_empty)}). "
+                                   f"{changes}. Pass --confirm {plan.live_database}")
+            self._dr_empty = empty
+            self._rerun = rerun if rerun is not None and rerun['strategy'] == RestoreStrategyChoices.IN_PLACE \
+                else None
             journal = journal_mod.Journal.create(
                 plan.set_id, strategy, plan.target, source_instance_id=plan.source_instance_id,
                 components=plan.components, plan=plan.as_dict(), user=self.user, live_database=plan.live_database,
@@ -525,9 +608,18 @@ class Restorer:
 
     def _safety(self, journal, keyring, skip_safety):
         from .backup import run_backup
-        empty, *_ = _live_state(conf.database())
-        if empty:
-            journal.step('safety', status='skipped', detail='live database is empty')
+        rerun = getattr(self, '_rerun', None)
+        if rerun is not None:
+            # The live database may hold half a load: never take a new safety set of that, reuse the first one
+            journal.update(rerun_of=rerun.restore_id, safety_set_id=rerun.get('safety_set_id'),
+                           safety_target=rerun.get('safety_target'), safety_local=rerun.get('safety_local'))
+            rerun.update(status='superseded', superseded_by=journal.restore_id)
+            rerun.step('superseded', detail=f'rerun as {journal.restore_id}')
+            journal.step('safety', status='reused',
+                         detail=f"safety set {rerun.get('safety_set_id') or '(none)'} of restore {rerun.restore_id}")
+            return
+        if getattr(self, '_dr_empty', False):
+            journal.step('safety', status='skipped', detail='live database is empty (disaster-recovery mode)')
             return
         if skip_safety:
             journal.warn('--skip-safety: no safety set was taken')
@@ -576,8 +668,11 @@ class Restorer:
         journal.update(emptied=True)
         journal.step('empty', detail=target_db.name)
         if missing:
+            dropped = pgcore.acl_statements(target_db, dump_path, missing)
+            journal.update(dropped_grants=dropped)
             journal.warn(f"Grantee role(s) {', '.join(missing)} missing on this server: loaded without privileges; "
-                         f"re-apply their grants")
+                         f"the {len(dropped)} dropped GRANT/REVOKE/ALTER DEFAULT PRIVILEGES statement(s) are in the "
+                         f"journal (dropped_grants) to re-apply once the roles exist")
         self.log.info(f"Loading the dump into {target_db.name} ({self.config.restore_jobs} jobs)")
         pgcore.load_dump(target_db, dump_path, jobs=self.config.restore_jobs, no_privileges=bool(missing),
                          log=self.log)
@@ -595,6 +690,9 @@ class Restorer:
         journal = journal or journal_mod.load(restore_id, statuses=('loaded', 'finishing'))
         if journal is None:
             raise RestoreError("No loaded restore to finish (see: nbbackup restore status)")
+        if qa and not self.config.instance_id_pinned:
+            raise RestoreError("A QA instance needs its own pinned instance_id; otherwise it would write below "
+                               "production's")
         live = live_database_name()
         slot = journal['strategy'] == RestoreStrategyChoices.SLOT
         connection.close()
@@ -620,11 +718,12 @@ class Restorer:
         spool = conf.spool_dir('restore', journal.restore_id)
         files = self._file_components(journal, spool)
         safety_copies = {}
-        for component in FILE_COMPONENTS:
-            if component in files:
-                path = os.path.join(spool, f'{component}-before.tar.zst')
-                media_mod.snapshot_storage(component, path)
-                safety_copies[component] = path
+        with self._keyring() as keyring:
+            for component in FILE_COMPONENTS:
+                if component in files:
+                    path = os.path.join(spool, f'{component}-before.tar.zst.enc')
+                    media_mod.snapshot_storage(component, path, keyring)
+                    safety_copies[component] = path
         journal.update(media_safety=safety_copies)
         journal.step('media safety copy', detail=', '.join(safety_copies) or 'no file components')
 
@@ -632,6 +731,7 @@ class Restorer:
 
         from django.core.management import call_command
         call_command('migrate', interactive=False, verbosity=0, stdout=io.StringIO())
+        conf.forget_recorded_instance()  # the restored database brings its own InstanceIdentity row
         journal.step('migrate')
         self._reset_runtime_state(journal)
         call_command('reindex', lazy=True, verbosity=0, stdout=io.StringIO())
@@ -639,9 +739,11 @@ class Restorer:
             pgcore.analyze(conn)
         journal.step('reindex and analyze')
 
+        # Media and scripts, every path: through STORAGES["default"] and STORAGES["scripts"] with the same guards
         for component, path in files.items():
             if component in FILE_COMPONENTS and os.path.exists(path):
                 result = media_mod.restore_archive(component, path, journal.restore_id, log=self.log)
+                os.unlink(path)  # plaintext; storage still holds the set if it is needed again
                 journal.step(f'restore {component}', detail=f"{result['written']} written, "
                                                             f"{result['quarantined']} quarantined")
 
@@ -657,6 +759,7 @@ class Restorer:
             self.log.warning(message)
         journal.update(resurrected=report)
         self._check_peppers(journal)
+        self._compare_secrets(journal)
 
         from . import catalog
         try:
@@ -706,6 +809,59 @@ class Restorer:
         deleted, _ = Session.objects.all().delete()
         journal.step('sessions', detail=f"{deleted} session(s) deleted")
 
+    def _drill_config(self, journal, backend, keyring, manifest, spool, keys_used):
+        """
+        The config component is encrypted to the recovery key alone: a drill with that key mounted decrypts and
+        parses it, others record that it was not readable here.
+        """
+        if layout.OBJECT_NAMES['config'] not in manifest.objects:
+            return
+        try:
+            path = sets.fetch_and_decrypt(backend, keyring, manifest, ['config'], spool, keys_used=keys_used)['config']
+            files = _drill_config_doc(path).get('files', {})
+            os.unlink(path)
+            journal.step('config', detail=f'{len(files)} configuration file(s), decrypted by {keys_used["config"]}')
+        except GPGError:
+            keys_used.pop('config', None)
+            journal.step('config', status='skipped', detail='needs the recovery key (not mounted here)')
+
+    def _compare_secrets(self, journal):
+        """
+        Name the secrets that differ between this host and the set. The config component is encrypted to the
+        recovery key alone, so this works only where that key is mounted; never prints a value.
+        """
+        import json
+        backend = get_backend(self.config.target(journal['target']))
+        try:
+            manifest = sets.load_manifest(backend, journal.get('source_instance_id') or self.config.instance_id,
+                                          journal['set_id'])
+            if layout.OBJECT_NAMES['config'] not in manifest.objects:
+                return
+            spool = conf.spool_dir('restore', journal.restore_id)
+            with self._keyring() as keyring:
+                manifest_mod.verify(manifest, keyring)
+                path = sets.fetch_and_decrypt(backend, keyring, manifest, ['config'], spool)['config']
+            with open(path, 'rb') as f:
+                from_set = secrets_mod.from_config_component(json.loads(f.read()))
+            os.unlink(path)
+        except (GPGError, sets.SetError, StorageError, manifest_mod.ManifestError) as e:
+            journal.step('compare secrets', status='skipped',
+                         detail=f"config component not readable here ({str(e)[:120]}); compare with: netbox-backup "
+                                f"decrypt {journal['set_id']} --components config --format env (recovery key)")
+            return
+        current = {
+            'SECRET_KEY': settings.SECRET_KEY,
+            'API_TOKEN_PEPPERS': dict(getattr(settings, 'API_TOKEN_PEPPERS', {}) or {}),
+            'DB_PASSWORD': settings.DATABASES['default'].get('PASSWORD'),
+        }
+        differ, unknown = secrets_mod.differences(from_set, current)
+        if differ:
+            message = f"Secrets differ between this host and the set: {', '.join(differ)}"
+            journal.warn(message)
+            self.log.warning(message)
+        journal.step('compare secrets', detail=f"differ: {', '.join(differ) or 'none'}"
+                                               + (f"; not comparable: {', '.join(unknown)}" if unknown else ''))
+
     def _check_peppers(self, journal):
         from users.models import Token
         configured = set(getattr(settings, 'API_TOKEN_PEPPERS', {}) or {})
@@ -715,7 +871,7 @@ class Restorer:
                          f"tokens stop validating. Restore the original peppers, or reissue the tokens.")
 
     def _enqueue_full_backup(self, journal):
-        from ..jobs import QUEUE, BackupJob
+        from ..jobs import enqueue_backup
         from ..models import BackupPolicy
         from . import catalog
         catalog.sync_static(self.config)
@@ -724,8 +880,7 @@ class Restorer:
             journal.warn('No enabled policy: take a full backup now')
             return
         try:
-            BackupJob.enqueue(instance=policy, policy=policy.name, trigger=TriggerChoices.POST_RESTORE,
-                              queue_name=QUEUE, job_timeout=int(policy.max_runtime.total_seconds()))
+            enqueue_backup(policy, trigger=TriggerChoices.POST_RESTORE)
             journal.step('enqueue full backup', detail=policy.name)
         except Exception as e:
             journal.warn(f"Could not enqueue the post-restore backup: {e}")
@@ -754,10 +909,13 @@ class Restorer:
             if confirm != live:
                 raise RestoreError(f"Rollback reloads {live} from the safety set: pass --confirm {live}")
             self._reload_safety(journal)
-        for component, path in (journal.get('media_safety') or {}).items():
-            if os.path.exists(path):
-                result = media_mod.restore_archive(component, path, f'{journal.restore_id}-rollback', log=self.log)
-                journal.step(f'restore {component}', detail=f"{result['written']} written from the safety copy")
+        safety_copies = {c: p for c, p in (journal.get('media_safety') or {}).items() if os.path.exists(p)}
+        if safety_copies:
+            with self._keyring() as keyring:
+                for component, path in safety_copies.items():
+                    result = media_mod.restore_encrypted_archive(component, path, f'{journal.restore_id}-rollback',
+                                                                 keyring, log=self.log)
+                    journal.step(f'restore {component}', detail=f"{result['written']} written from the safety copy")
         if journal['strategy'] == RestoreStrategyChoices.IN_PLACE:
             self._reset_runtime_state(journal)
         journal.update(status='rolled-back')
@@ -836,14 +994,16 @@ class Restorer:
             paths = sets.fetch_and_decrypt(backend, keyring, manifest, list(components), spool)
         journal.step('fetch')
         safety = {}
-        for component in components:
-            path = os.path.join(spool, f'{component}-before.tar.zst')
-            media_mod.snapshot_storage(component, path)
-            safety[component] = path
+        with self._keyring() as keyring:
+            for component in components:
+                path = os.path.join(spool, f'{component}-before.tar.zst.enc')
+                media_mod.snapshot_storage(component, path, keyring)
+                safety[component] = path
         journal.update(media_safety=safety, files=paths, status='finishing')
         journal.step('media safety copy')
         for component, path in paths.items():
             result = media_mod.restore_archive(component, path, journal.restore_id, log=self.log)
+            os.unlink(path)
             journal.step(f'restore {component}', detail=f"{result['written']} written, "
                                                         f"{result['quarantined']} quarantined")
         now = timezone.now()
@@ -879,9 +1039,17 @@ class Restorer:
             backend = get_backend(self.config.target(plan.target))
             manifest = sets.load_manifest(backend, plan.source_instance_id, plan.set_id)
             spool = conf.spool_dir('restore', journal.restore_id)
+            keys_used = {}
             try:
-                paths = sets.fetch_and_decrypt(backend, keyring, manifest, ['database'], spool)
-                journal.step('fetch')
+                available = [c for c in ('database', 'media', 'scripts')
+                             if layout.OBJECT_NAMES[c] in manifest.objects]
+                paths = sets.fetch_and_decrypt(backend, keyring, manifest, available, spool, keys_used=keys_used)
+                journal.step('fetch', detail=', '.join(f'{c} decrypted by {k}' for c, k in keys_used.items()))
+                for component in ('media', 'scripts'):
+                    if component in paths:
+                        members = media_mod.archive_members(paths[component])
+                        journal.step(f'list {component}', detail=f'{len(members)} member(s), every path checked')
+                self._drill_config(journal, backend, keyring, manifest, spool, keys_used)
                 self._load_database(journal, plan, conf.database(dbname=slot), paths['database'])
                 pending = _pending_migrations(slot)
                 journal.step('migration plan', detail=f"{len(pending)} migration(s) would be applied")
@@ -889,13 +1057,22 @@ class Restorer:
                 with conf.database(dbname=slot).connect() as conn:
                     pgcore.empty_database(conn)
                 shutil.rmtree(spool, ignore_errors=True)
-        BackupSet.objects.filter(set_id=plan.set_id).update(
-            verify_level=VerifyLevelChoices.QA_RESTORE, qa_passed_at=timezone.now(), verified_at=timezone.now(),
-            status=SetStatusChoices.VERIFIED,
-        )
-        journal.update(status='finished', finished=timezone.now().isoformat())
+        now = timezone.now()
+        fields = {'verify_level': VerifyLevelChoices.QA_RESTORE, 'qa_passed_at': now, 'verified_at': now,
+                  'status': SetStatusChoices.VERIFIED}
+        recovery = self.config.crypto.recovery_key
+        if recovery and keys_used and all(k == recovery for k in keys_used.values()):
+            fields['recovery_drill_at'] = now  # the offline recovery key alone restored this set
+        BackupSet.objects.filter(set_id=plan.set_id).update(**fields)
+        journal.update(status='finished', finished=now.isoformat(), keys_used=keys_used)
         journal.step('drill passed')
         return journal
+
+
+def _drill_config_doc(path):
+    import json
+    with open(path, 'rb') as f:
+        return json.loads(f.read())
 
 
 def _verify_local(path, obj):

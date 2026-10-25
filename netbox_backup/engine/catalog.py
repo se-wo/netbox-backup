@@ -11,7 +11,9 @@ from django.utils import timezone
 from .. import conf
 from ..choices import CopyStatusChoices, SetStatusChoices, TriggerChoices, VerifyLevelChoices
 from ..core import layout, sets
+from ..core.gpg import GPGError, Keyring
 from ..core.manifest import ManifestError
+from ..core.manifest import verify as manifest_verify
 from ..storage import StorageError, get_backend
 
 logger = logging.getLogger('netbox_backup')
@@ -45,7 +47,7 @@ def sync_static(config=None):
             obj, _ = BackupPolicy.objects.update_or_create(name=name, defaults={
                 'components': list(policy.components), 'schedule': policy.schedule or '',
                 'time_zone': policy.time_zone or '', 'primary_target': targets[policy.target],
-                'retention': policy.retention.as_dict(), 'recipients': list(config.crypto.recipients),
+                'retention': policy.retention.as_dict(), 'recipients': list(config.crypto.all_recipients),
                 'zstd_level': policy.zstd_level, 'verify_schedule': policy.verify_schedule or '',
                 'max_runtime': policy.max_runtime, 'enabled': policy.enabled, 'is_static': True,
             })
@@ -80,6 +82,17 @@ def set_fields_from_header(header):
 
 
 def sync(config=None, log=None, keyring=None):
+    if keyring is None and (config or conf.get_config()).crypto.configured:
+        try:
+            with Keyring((config or conf.get_config()).crypto) as own:
+                return _sync(config, log, own)
+        except GPGError as e:
+            (log or logger).warning(f"Catalog sync: signatures cannot be checked ({e}); importing nothing")
+            return {'created': 0, 'updated': 0, 'expired': 0, 'errors': 1}
+    return _sync(config, log, keyring)
+
+
+def _sync(config=None, log=None, keyring=None):
     """
     Rebuild BackupSet/BackupCopy rows for this instance from every target. Sets that disappeared from all targets
     are marked expired; expired rows older than 90 days are deleted. Returns counts.
@@ -89,6 +102,9 @@ def sync(config=None, log=None, keyring=None):
     config = config or conf.get_config()
     targets = sync_static(config)
     instance_id = config.instance_id
+    if instance_id is None:
+        log.info("Catalog sync: no instance_id yet (unpinned, no backup taken)")
+        return {'created': 0, 'updated': 0, 'expired': 0, 'errors': 0}
     stats = {'created': 0, 'updated': 0, 'expired': 0, 'errors': 0}
     seen = set()
     policies = {p.name: p for p in BackupPolicy.objects.all()}
@@ -105,7 +121,11 @@ def sync(config=None, log=None, keyring=None):
                 continue
             try:
                 manifest = sets.load_manifest(backend, instance_id, listing.set_id)
-            except (sets.SetError, ManifestError, StorageError) as e:
+                if keyring is not None:
+                    # Only a correctly signed manifest behind a matching _COMPLETE counts; it then overrides a
+                    # catalog row that says the set failed
+                    manifest_verify(manifest, keyring)
+            except (sets.SetError, ManifestError, StorageError, GPGError) as e:
                 log.warning(f"Catalog sync: set {listing.set_id} on {name}: {e}")
                 stats['errors'] += 1
                 continue

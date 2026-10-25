@@ -6,11 +6,11 @@
 |---|---|
 | `run [<policy>] [--components ...] [--background]` | A backup now; `--background` enqueues it on the plugin queue |
 | `pre-upgrade [--policy]` | A manual set tagged for an upgrade |
-| `list [--target] [--instance] [--json]` | Sets in storage (no catalog needed) |
+| `list [--target] [--instance] [--all-instances] [--json]` | Sets in storage (no catalog needed); `--all-instances` lists every instance on the target |
 | `show [<set>] [--json]` | Signed header, plus the decrypted body summary when an identity is mounted |
 | `verify [<set>]` | Level-1 check of every copy |
 | `verify [<set>] --drill [--headroom-confirmed]` | Level 2 on demand: load into the restore slot, check the baseline and migration plan, empty the slot |
-| `prune [--dry-run] [--target ...]` | Apply retention; deletes only with a prune credential |
+| `prune [--dry-run] [--target ...]` | Apply retention; deletes only with a prune credential. Reports held policies (newest sets unverified) and expired probe objects |
 | `slot init <database>` | Mark an empty database owned by the NetBox role as the restore slot |
 | `restore plan [<set>] [--from-instance] [--components] [--json]` | Preflight; recommends `--slot` or `--in-place` |
 | `restore load [<set>] --slot \| --in-place --confirm <db> [--skip-safety] [--revoke-resurrected]` | Load the set |
@@ -20,9 +20,9 @@
 | `restore finalize [<restore>] [--force]` | Empty the old database after `rollback_days` |
 | `restore media [<set>] [--components media scripts]` | Media alone, against the live database |
 | `catalog sync` | Rebuild sets and copies from storage |
-| `target probe [<name>]` | Round trip, create-only check, default retention, lifecycle rule |
-| `keys generate --name <uid> --out <dir> [--passphrase-env VAR]` | A brainpoolP384r1 key pair, written as `<fingerprint>.pub.asc` / `.sec.asc` |
-| `status [--json] [--no-workers]` | Health; exits 0 ok, 1 warning, 2 error |
+| `target probe [<name>]` | Pooled-session check on the database, then round trip, create-only check, a two-part upload with the target's encryption settings (ETag vs local MD5), default retention, lifecycle rule |
+| `keys generate --role ops\|recovery\|signing --name <uid> --out <dir> [--passphrase-env VAR]` | A brainpoolP384r1 key pair, written as `<fingerprint>.pub.asc` / `.sec.asc`; recovery and signing keys require `--passphrase-env` |
+| `status [--json] [--no-workers]` | Health; exits 0 ok, 1 warning, 2 error. pgBackRest is reported separately and doesn't affect the exit code |
 
 `<set>` is a ULID, a unique ULID prefix, or `latest` (the default).
 
@@ -31,14 +31,15 @@
 | Command | Does |
 |---|---|
 | `list [--all-instances] [--json]` | Sets per target |
-| `verify [<set>] [--deep]` | Level 1; `--deep` downloads every object, checks SHA-384 and decrypts when an identity is configured |
+| `verify [<set>] [--deep]` | Level 1; `--deep` downloads every object, checks SHA-384 and decrypts when an identity is configured (the config component is skipped without the recovery key) |
 | `fetch [<set>] --out <dir>` | Ciphertext and manifest, hash-checked |
-| `decrypt [<set>] --out <dir> [--components ...]` | Verified plaintext components plus the manifest body |
+| `decrypt [<set>] --out <dir> [--components ...] [--format files\|env]` | Verified plaintext components plus the manifest body. Without `--components`, config is included only where the recovery key is mounted. `--format env` also writes `secrets.env` (0600) |
 | `restore-db [<set>] --dsn <url> [--confirm <db>]` | Load the database component into a marked slot or a confirmed database, then check the baseline |
 | `check --max-age 26h` | Dead-man's check against storage: exit 0 ok, 2 too old or unreachable |
 
 Global options are `--config` (a JSON file with the plugin dict, or a `configuration.py`; default
-`$NETBOX_BACKUP_CONFIG` or `/etc/netbox-backup.json`), `--target` and `--instance`. `restore-db` reads the password
+`$NETBOX_BACKUP_CONFIG` or `/etc/netbox-backup.json`), `--target` and `--instance`. Every command but `list`
+needs a pinned `instance_id` in that file or `--instance`. `restore-db` reads the password
 from the DSN or `PGPASSWORD`.
 
 ## REST API (`/api/plugins/backup/`)
@@ -73,7 +74,7 @@ to the web process's `/metrics`):
 
 | Metric | Labels |
 |---|---|
-| `netbox_backup_last_success_timestamp_seconds` | policy, target |
+| `netbox_backup_last_success_timestamp_seconds` | policy, target (until a policy has a verified set: its creation time, so a first backup that never succeeds still alerts) |
 | `netbox_backup_last_verified_timestamp_seconds` | policy, level |
 | `netbox_backup_scheduler_last_tick_timestamp_seconds` | |
 | `netbox_backup_enabled_policies` | |
@@ -85,6 +86,7 @@ to the web process's `/metrics`):
 
 [`contrib/prometheus-alerts.yml`](../contrib/prometheus-alerts.yml) has example rules:
 * no success within interval + max_runtime + 1 h;
+* the gauges absent altogether (`absent()`: metrics disabled, the plugin not loaded, the scrape failing);
 * no scheduler run for 15 minutes;
 * a drop in enabled policies;
 * no locked off-site copy;
@@ -92,4 +94,5 @@ to the web process's `/metrics`):
 * a failed probe;
 * no QA restore in 35 days.
 
-Add `netbox-backup check --max-age 26h` to external monitoring; it catches a NetBox that is down entirely.
+Add `netbox-backup check --max-age 26h` to external monitoring; it catches a NetBox that is down entirely, and fails
+on an empty prefix (a first backup that never arrived).

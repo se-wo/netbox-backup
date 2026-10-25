@@ -253,6 +253,8 @@ class CryptoConfig:
     compliance: str | None = None
     public_keys: str | None = None
     recipients: tuple = ()
+    # The offline recovery key: a recipient of every object, and the only recipient of the config component
+    recovery_key: str | None = None
     signing_key: str | None = None
     signing_secret_key: str | None = None
     signing_passphrase: str | None = None
@@ -279,9 +281,14 @@ class CryptoConfig:
             raise ConfigError("crypto.compliance must be None or 'de-vs'")
         recipients = tuple(_fingerprint(f, 'crypto.recipients') for f in data.get('recipients') or ())
         signing_key = _fingerprint(data['signing_key'], 'crypto.signing_key') if data.get('signing_key') else None
+        recovery_key = _fingerprint(data['recovery_key'], 'crypto.recovery_key') if data.get('recovery_key') else None
+        if signing_key and (signing_key in recipients or signing_key == recovery_key):
+            raise ConfigError("crypto.signing_key must not also be a recipient: the always-on worker holds its secret "
+                              "key, so it would decrypt every set")
         return cls(
             gpg_binary=data.get('gpg_binary') or 'gpg', compliance=compliance, public_keys=data.get('public_keys'),
-            recipients=recipients, signing_key=signing_key, signing_secret_key=data.get('signing_secret_key'),
+            recipients=recipients, recovery_key=recovery_key, signing_key=signing_key,
+            signing_secret_key=data.get('signing_secret_key'),
             signing_passphrase=data.get('signing_passphrase'), identities=identities,
             identity_passphrase=data.get('identity_passphrase'),
             trusted_signers=tuple(_fingerprint(f, 'crypto.trusted_signers') for f in data.get('trusted_signers') or ()),
@@ -289,7 +296,14 @@ class CryptoConfig:
 
     @property
     def configured(self):
-        return bool(self.public_keys and self.recipients and self.signing_key)
+        return bool(self.public_keys and self.recipients and self.recovery_key and self.signing_key)
+
+    @property
+    def all_recipients(self):
+        """
+        Every object's recipients: the operational keys plus the recovery key.
+        """
+        return tuple(dict.fromkeys([*self.recipients, *([self.recovery_key] if self.recovery_key else [])]))
 
 
 def _fingerprint(value, label):
@@ -301,7 +315,7 @@ def _fingerprint(value, label):
 
 @dataclass(frozen=True)
 class Config:
-    instance_id: str
+    instance_id: str | None
     instance_id_pinned: bool
     targets: dict
     policies: dict
@@ -315,11 +329,16 @@ class Config:
     rollback_days: int = 2
     allow_download: bool = False
     verify_dump: bool = True
+    direct_connection: dict = field(default_factory=dict)
     pgbackrest: dict | None = None
     raw: dict = field(default_factory=dict, compare=False, repr=False)
 
     @classmethod
-    def from_dict(cls, data, fallback_instance_seed=None):
+    def from_dict(cls, data):
+        """
+        Without a pinned instance_id, instance_id is None here; the plugin resolves the random ID it recorded on its
+        first backup. The standalone CLI and QA restores need it pinned.
+        """
         data = dict(data or {})
         instance_id = data.get('instance_id')
         pinned = bool(instance_id)
@@ -328,11 +347,8 @@ class Config:
                 instance_id = str(uuid.UUID(str(instance_id)))
             except ValueError as e:
                 raise ConfigError("instance_id must be a UUID (generate one with 'uuidgen')") from e
-        elif fallback_instance_seed:
-            # Stable without configuration, but tied to the seed (NetBox's SECRET_KEY); health warns until pinned.
-            instance_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f'netbox-backup:{fallback_instance_seed}'))
         else:
-            raise ConfigError("instance_id is required")
+            instance_id = None
 
         targets = {}
         for name, target in (data.get('targets') or {}).items():
@@ -351,6 +367,11 @@ class Config:
         databases = tuple(data.get('databases') or ())
         if databases and len(databases) != 2:
             raise ConfigError("databases must list exactly two database names (live and restore slot)")
+        direct = dict(data.get('direct_connection') or {})
+        bad = sorted(set(direct) - {'host', 'port', 'sslmode', 'sslrootcert', 'hostaddr'})
+        if bad:
+            raise ConfigError(f"direct_connection accepts host, port, hostaddr, sslmode and sslrootcert, not "
+                              f"{', '.join(bad)}")
         restore_jobs = data.get('restore_jobs', 4)
         if type(restore_jobs) is not int or restore_jobs < 1:
             raise ConfigError("restore_jobs must be a positive integer")
@@ -361,6 +382,7 @@ class Config:
             pg_restore=data.get('pg_restore') or 'pg_restore', psql=data.get('psql') or 'psql',
             restore_jobs=restore_jobs, rollback_days=int(data.get('rollback_days', 2)),
             allow_download=bool(data.get('allow_download', False)), verify_dump=bool(data.get('verify_dump', True)),
+            direct_connection=direct,
             pgbackrest=data.get('pgbackrest'), raw=data,
         )
 

@@ -2,6 +2,7 @@
 The plugin's view of the static configuration in PLUGINS_CONFIG['netbox_backup'], plus the NetBox database as a
 core.pg.Database.
 """
+import dataclasses
 import os
 import tempfile
 
@@ -31,17 +32,42 @@ def raw():
 
 def get_config():
     """
-    The parsed Config. Re-parsed whenever PLUGINS_CONFIG changes (tests override it).
+    The parsed Config. Re-parsed whenever PLUGINS_CONFIG changes (tests override it). Without a pinned instance_id,
+    instance_id is the random ID this install recorded on its first backup (None before that).
     """
     data = raw()
-    key = repr(sorted(data.items(), key=lambda kv: kv[0])) + settings.SECRET_KEY
+    key = repr(sorted(data.items(), key=lambda kv: kv[0]))
     if _cache.get('key') != key:
         try:
-            _cache['config'] = Config.from_dict(data, fallback_instance_seed=settings.SECRET_KEY)
+            _cache['config'] = Config.from_dict(data)
         except ConfigError as e:
             raise ImproperlyConfigured(f"netbox_backup: {e}") from e
         _cache['key'] = key
-    return _cache['config']
+    config = _cache['config']
+    if config.instance_id_pinned:
+        return config
+    recorded = recorded_instance()
+    return dataclasses.replace(config, instance_id=recorded['instance_id']) if recorded else config
+
+
+def recorded_instance():
+    """
+    The InstanceIdentity row of an unpinned install, as a dict, or None (none yet, or no tables yet).
+    """
+    if _cache.get('recorded') is not None:
+        return _cache['recorded']
+    try:
+        from .models import InstanceIdentity
+        row = InstanceIdentity.objects.values('instance_id', 'hostname', 'allowed_hosts').first()
+    except Exception:  # an empty or unmigrated database during disaster recovery
+        return None
+    if row:
+        _cache['recorded'] = row
+    return row
+
+
+def forget_recorded_instance():
+    _cache.pop('recorded', None)
 
 
 def instance_id():
@@ -50,7 +76,9 @@ def instance_id():
 
 def database(alias='default', dbname=None):
     """
-    The NetBox database (or another database on the same server) as a core.pg.Database.
+    The NetBox database (or another database on the same server) as a core.pg.Database. direct_connection
+    overrides host and port, so the engine's sessions (advisory lock, snapshot, pg_dump, pg_restore) bypass a
+    transaction-mode pooler such as PgBouncer on Azure Flexible Server's port 6432, which NetBox itself may use.
     """
     db = settings.DATABASES[alias]
     params = {
@@ -64,6 +92,7 @@ def database(alias='default', dbname=None):
         if key in LIBPQ_OPTIONS and value is not None:
             params[key] = value
     config = get_config()
+    params.update({k: v for k, v in config.direct_connection.items() if v not in (None, '')})
     return Database(
         params, password=db.get('PASSWORD') or None, pg_dump=config.pg_dump, pg_restore=config.pg_restore,
         psql=config.psql,

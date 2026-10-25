@@ -18,7 +18,7 @@ from netbox_backup import conf
 from netbox_backup.choices import CopyStatusChoices, SetStatusChoices, VerifyLevelChoices
 from netbox_backup.core import layout, manifest, sets
 from netbox_backup.core.config import RetentionConfig
-from netbox_backup.core.gpg import Keyring
+from netbox_backup.core.gpg import GPGError, Keyring
 from netbox_backup.engine import catalog, prune, retention, scheduler
 from netbox_backup.engine.backup import BackupError, run_backup
 from netbox_backup.engine.locks import LockHeld, advisory_lock
@@ -49,10 +49,17 @@ class MediaMixin:
         os.makedirs(os.path.join(self.media, 'image-attachments'))
         with open(os.path.join(self.media, 'image-attachments', 'rack.png'), 'wb') as f:
             f.write(b'\x89PNG fake')
-        self.media_override = self.settings(STORAGES={
+        self.scripts = os.path.join(self.tmp, 'scripts')
+        os.makedirs(self.scripts)
+        with open(os.path.join(self.scripts, 'custom.py'), 'w') as f:
+            f.write('# a custom script\n')
+        # ScriptFileSystemStorage takes its location from SCRIPTS_ROOT, not from OPTIONS
+        self.media_override = self.settings(SCRIPTS_ROOT=self.scripts, STORAGES={
             **settings.STORAGES,
             'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage',
                         'OPTIONS': {'location': self.media}},
+            'scripts': {'BACKEND': 'extras.storage.ScriptFileSystemStorage',
+                        'OPTIONS': {'location': self.scripts, 'allow_overwrite': True}},
         })
         self.media_override.enable()
         self._reset_storages()
@@ -66,6 +73,7 @@ class MediaMixin:
     def _reset_storages():
         from django.core.files.storage import storages
         storages._storages.pop('default', None)
+        storages._storages.pop('scripts', None)
 
 
 class BackupTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
@@ -108,7 +116,15 @@ class BackupTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
             self.assertEqual(body['baseline']['tables']['public.dcim_site'], 25)
             self.assertIn('dcim.0001_squashed', ' '.join(body['migrations']))
             spool = conf.spool_dir('test')
-            paths = sets.fetch_and_decrypt(backend, keyring, loaded, ['config', 'media'], spool)
+            sets.fetch_and_decrypt(backend, keyring, loaded, ['media'], spool)
+            # The config component (it carries the secrets) is encrypted to the recovery key only
+            self.assertEqual(loaded.objects['config.json.enc']['recipients'],
+                             [conf.get_config().crypto.recovery_key])
+            with self.assertRaisesMessage(GPGError, 'No mounted identity'):
+                sets.fetch_and_decrypt(backend, keyring, loaded, ['config'], spool)
+        self.configure(crypto=self.crypto_config(identities=('recovery',)))
+        with Keyring(conf.get_config().crypto, identities=True) as keyring:
+            paths = sets.fetch_and_decrypt(backend, keyring, loaded, ['config'], spool)
             config_doc = json.loads(open(paths['config'], 'rb').read())
             self.assertTrue(any(p.endswith('.py') for p in config_doc['files']))
 
@@ -234,15 +250,31 @@ class SchedulerTest(PluginConfigMixin, TestCase):
         self.assertEqual(BackupPolicy.objects.get().primary_target, StorageTarget.objects.get(name='primary'))
         self.assertIsNotNone(scheduler.last_tick())
 
-    def test_backup_job_enqueues_on_plugin_queue(self):
+    def test_jobs_carry_their_own_rq_timeout(self):
+        """
+        RQ_DEFAULT_TIMEOUT (300 s) would kill any backup longer than five minutes.
+        """
+        import django_rq
         from core.models import Job
 
-        from netbox_backup.jobs import QUEUE, BackupJob
+        from netbox_backup.jobs import QUEUE, enqueue_backup, enqueue_prune, enqueue_verify
+        self.configure(policies={'default': {'max_runtime': '6h'}})
         catalog.sync_static()
         policy = BackupPolicy.objects.get()
-        job = BackupJob.enqueue(instance=policy, policy=policy.name, queue_name=QUEUE)
+        with self.captureOnCommitCallbacks(execute=True):  # Job.enqueue hands the job to RQ on commit
+            job = enqueue_backup(policy)
+            prune_job = enqueue_prune()
+            verify_job = enqueue_verify('X')
         self.assertEqual(Job.objects.get(pk=job.pk).object, policy)
         self.assertEqual(job.queue_name, QUEUE)
+        queue = django_rq.get_queue(QUEUE)
+        try:
+            self.assertEqual(queue.fetch_job(str(job.job_id)).timeout, 6 * 3600)
+            self.assertEqual(queue.fetch_job(str(prune_job.job_id)).timeout, 6 * 3600)
+            self.assertEqual(queue.fetch_job(str(verify_job.job_id)).timeout, 3600)
+        finally:
+            for j in (job, prune_job, verify_job):
+                queue.remove(str(j.job_id))
 
     def test_worst_case_loss_and_next_runs(self):
         policy = conf.get_config().policies['default']
@@ -331,15 +363,17 @@ class ProbeCollectionTest(PluginConfigMixin, TestCase):
 
     def test_expired_probe_collected(self):
         target = self.use_bucket('probes', locked=False)
-        self.assertEqual(len(self.probe_keys(target)), 1)
+        self.assertEqual(len(self.probe_keys(target)), 2)  # the round-trip object and the two-part upload
         fresh = prune.prune_target(conf.get_config(), target)
         self.assertEqual(fresh.probes_due, [])  # younger than a day
         report = prune.prune_target(conf.get_config(), target, now=timezone.now() + timedelta(days=2))
-        self.assertEqual(report.probes_deleted, 1)
+        self.assertEqual(report.probes_deleted, 2)
         self.assertEqual(self.probe_keys(target), [])
 
     def test_locked_probe_kept(self):
         target = self.use_bucket('locked-probes', locked=True)
         report = prune.prune_target(conf.get_config(), target, now=timezone.now() + timedelta(days=2))
-        self.assertEqual(report.probes_due, [])
-        self.assertEqual(len(self.probe_keys(target)), 1)
+        # moto doesn't apply a bucket's default retention to multipart uploads (S3 does), so only the
+        # single-put probe object is locked here
+        self.assertEqual([k for k in report.probes_due if not k.endswith('-multipart')], [])
+        self.assertEqual(len([k for k in self.probe_keys(target) if not k.endswith('-multipart')]), 1)

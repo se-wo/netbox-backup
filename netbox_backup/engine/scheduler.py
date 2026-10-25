@@ -63,23 +63,44 @@ def queue_workers():
     return sum(1 for w in Worker.all(connection=connection) if QUEUE in w.queue_names())
 
 
-def fail_overruns(now=None):
+def fail_overruns(now=None, log=None):
     """
-    Mark sets still running past their policy's max_runtime as failed (the job was killed or the worker died).
+    Sets still running past max_runtime + 10 minutes. A set is declared failed only once its policy's lock is free,
+    i.e. the job is really gone; a hung job still holding it has its lock sessions terminated, so the policy can run
+    again (the job itself refuses to write the manifest after max_runtime). Returns the number marked failed.
     """
     from ..models import BackupSet
+    from .locks import reclaim
+    log = log or logger
     now = now or timezone.now()
     failed = 0
     for backup_set in BackupSet.objects.filter(status__in=SetStatusChoices.ACTIVE).select_related('policy'):
         limit = backup_set.policy.max_runtime if backup_set.policy else timedelta(hours=4)
-        if backup_set.started and now - backup_set.started > limit + timedelta(minutes=10):
-            backup_set.status = SetStatusChoices.FAILED
-            backup_set.error = f'Exceeded max_runtime ({limit}) or the worker died'
-            backup_set.finished = now
-            backup_set.save()
-            backup_set.copies.filter(status__in=('pending', 'uploading')).update(status='failed')
-            failed += 1
+        if not backup_set.started or now - backup_set.started <= limit + timedelta(minutes=10):
+            continue
+        if not reclaim(f'policy:{backup_set.policy_name}'):
+            log.warning(f"Set {backup_set.set_id} overran max_runtime; its lock could not be freed yet")
+            continue
+        backup_set.status = SetStatusChoices.FAILED
+        backup_set.error = f'Exceeded max_runtime ({limit}); the job was killed, died or was terminated'
+        backup_set.finished = now
+        backup_set.save()
+        backup_set.copies.filter(status__in=('pending', 'uploading')).update(status='failed')
+        failed += 1
     return failed
+
+
+def record_skipped(row, reason, now):
+    """
+    A scheduled run that could not start is recorded as a failed set, so health and alerts see it.
+    """
+    from ..core import layout
+    from ..models import BackupSet
+    return BackupSet.objects.create(
+        set_id=layout.new_ulid(), instance_id=conf.instance_id(), policy=row, policy_name=row.name,
+        status=SetStatusChoices.FAILED, trigger=TriggerChoices.SCHEDULED, started=now, finished=now,
+        error=f'Skipped: {reason}',
+    )
 
 
 def tick(now=None, log=None):
@@ -89,14 +110,14 @@ def tick(now=None, log=None):
     from core.choices import JobStatusChoices
     from core.models import Job
 
-    from ..jobs import BackupJob, PruneJob
+    from ..jobs import BackupJob, PruneJob, enqueue_backup, enqueue_prune
     from ..models import BackupPolicy
     log = log or logger
     now = now or timezone.now()
     cache.set(TICK_CACHE_KEY, now.timestamp(), None)
     config = conf.get_config()
     catalog.sync_static(config)
-    fail_overruns(now)
+    fail_overruns(now, log=log)
     enqueued = []
     for name, policy in config.policies.items():
         if not policy.enabled or not policy.schedule:
@@ -113,14 +134,14 @@ def tick(now=None, log=None):
         active = BackupJob.get_jobs(row).filter(status__in=JobStatusChoices.ENQUEUED_STATE_CHOICES).exists()
         if active:
             log.warning(f"Policy {name}: previous backup still queued or running; skipping slot {slot:%Y-%m-%d %H:%M}")
+            record_skipped(row, 'the previous run of this policy was still queued or running', now)
         else:
-            BackupJob.enqueue(instance=row, policy=name, trigger=TriggerChoices.SCHEDULED, queue_name=QUEUE,
-                              job_timeout=int(policy.max_runtime.total_seconds()))
+            enqueue_backup(row, trigger=TriggerChoices.SCHEDULED)
             enqueued.append(name)
             log.info(f"Policy {name}: enqueued backup for slot {slot:%Y-%m-%d %H:%M %Z}")
         row.last_scheduled = slot
         row.save(update_fields=('last_scheduled',))
     recent_prune = Job.objects.filter(name=PruneJob.name, created__gte=now - timedelta(hours=24)).exists()
     if config.targets and not recent_prune:
-        PruneJob.enqueue(queue_name=QUEUE)
+        enqueue_prune()
     return enqueued

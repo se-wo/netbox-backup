@@ -27,7 +27,8 @@ class PluginConfigMixin:
         keys = KeyMaterial.get()
         return {
             'public_keys': f"file:{keys['bundle']}",
-            'recipients': [keys['ops']['fpr'], keys['recovery']['fpr']],
+            'recipients': [keys['ops']['fpr']],
+            'recovery_key': keys['recovery']['fpr'],
             'signing_key': keys['signing']['fpr'],
             'signing_secret_key': f"file:{keys['signing']['sec']}",
             'identities': [f"file:{keys[i]['sec']}" for i in identities],

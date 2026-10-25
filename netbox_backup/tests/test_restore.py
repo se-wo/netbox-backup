@@ -54,6 +54,8 @@ class InPlaceRestoreTest(RestoreTestBase):
         Site.objects.filter(name__in=[f'Site {i}' for i in range(5)]).delete()
         self.write_media('image-attachments/rack.png', b'changed')
         self.write_media('stray.txt')
+        with open(os.path.join(self.scripts, 'custom.py'), 'w') as f:
+            f.write('# edited after the backup\n')
         restorer = Restorer(user='tester')
 
         plan = build_plan(backup_set.set_id)
@@ -71,6 +73,10 @@ class InPlaceRestoreTest(RestoreTestBase):
         with open(os.path.join(self.media, 'image-attachments/rack.png'), 'rb') as f:
             self.assertEqual(f.read(), b'\x89PNG fake')
         self.assertFalse(os.path.exists(os.path.join(self.media, 'stray.txt')))
+        with open(os.path.join(self.scripts, 'custom.py')) as f:
+            self.assertEqual(f.read(), '# a custom script\n', 'scripts are restored through STORAGES["scripts"]')
+        spool_files = [n for _, _, names in os.walk(conf.spool_dir()) for n in names]
+        self.assertFalse(any(n.endswith('.tar.zst') for n in spool_files), 'no plaintext archive left on the spool')
         self.assertTrue(os.path.exists(os.path.join(self.media, media.QUARANTINE, journal.restore_id, 'stray.txt')))
         self.assertTrue(RestoreRun.objects.filter(restore_id=journal.restore_id, status='finished').exists())
         safety = BackupSet.objects.get(set_id=journal['safety_set_id'])

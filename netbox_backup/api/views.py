@@ -11,7 +11,7 @@ from .. import conf, filtersets
 from ..choices import TriggerChoices
 from ..core import layout, sets
 from ..engine import health
-from ..jobs import QUEUE, BackupJob
+from ..jobs import enqueue_backup
 from ..models import BackupPolicy, BackupSet, RestoreRun, StorageTarget
 from ..storage import StorageError, get_backend
 from . import serializers
@@ -37,9 +37,7 @@ class BackupPolicyViewSet(NetBoxReadOnlyModelViewSet):
         if not request.user.has_perm('netbox_backup.run_backuppolicy'):
             raise PermissionDenied('This user lacks the run_backuppolicy permission')
         policy = get_object_or_404(self.queryset.restrict(request.user, 'view'), pk=pk)
-        job = BackupJob.enqueue(instance=policy, user=request.user, policy=policy.name, trigger=TriggerChoices.API,
-                                created_by=request.user.username, queue_name=QUEUE,
-                                job_timeout=int(policy.max_runtime.total_seconds()))
+        job = enqueue_backup(policy, trigger=TriggerChoices.API, user=request.user, created_by=request.user.username)
         return Response({'job': job.pk, 'job_id': str(job.job_id)}, status=status.HTTP_202_ACCEPTED)
 
 

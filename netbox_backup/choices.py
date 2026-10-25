@@ -101,6 +101,7 @@ class RestoreStatusChoices(ChoiceSet):
     FINISHED = 'finished'
     ROLLED_BACK = 'rolled-back'
     FINALIZED = 'finalized'
+    SUPERSEDED = 'superseded'
     FAILED = 'failed'
 
     CHOICES = (
@@ -111,6 +112,7 @@ class RestoreStatusChoices(ChoiceSet):
         (FINISHED, _('Finished'), 'green'),
         (ROLLED_BACK, _('Rolled back'), 'orange'),
         (FINALIZED, _('Finalized'), 'gray'),
+        (SUPERSEDED, _('Superseded by a rerun'), 'gray'),
         (FAILED, _('Failed'), 'red'),
     )
 

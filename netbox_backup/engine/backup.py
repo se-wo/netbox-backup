@@ -9,6 +9,7 @@ Taking one backup set.
     4. Write the manifest, then _COMPLETE.
     5. Level-1 check: sizes and checksums as the backend reports them, the signature, the lock status.
 """
+import dataclasses
 import logging
 import socket
 
@@ -23,7 +24,7 @@ from ..core import pg as pgcore
 from ..core.gpg import Keyring
 from ..storage import ObjectExists, get_backend
 from . import catalog, components
-from .locks import advisory_lock
+from .locks import advisory_lock, assert_held
 
 logger = logging.getLogger('netbox_backup')
 
@@ -32,26 +33,63 @@ class BackupError(Exception):
     pass
 
 
+def this_host():
+    return {'hostname': socket.gethostname(), 'allowed_hosts': sorted(getattr(settings, 'ALLOWED_HOSTS', []))}
+
+
+def same_install(recorded, here):
+    """
+    Whether instance.json describes this install. ALLOWED_HOSTS decides; with a wildcard, the hostname must match.
+    Pod hostnames change on every rollout, so a hostname alone never decides when ALLOWED_HOSTS is specific.
+    """
+    hosts = sorted(recorded.get('allowed_hosts') or [])
+    if hosts != here['allowed_hosts']:
+        return False
+    return hosts not in ([], ['*']) or recorded.get('hostname') == here['hostname']
+
+
 def ensure_instance(backend, config):
     """
-    Claim <instance_id>/instance.json with a create-only write; refuse if another install claimed it first.
+    The instance_id to write under, claimed with a create-only instance.json. Unpinned installs generate a random
+    UUID on their first backup and record it; later, they refuse to back up if instance.json describes a different
+    install (a clone, a QA copy restored from production): pin instance_id there. Returns the instance_id.
     """
     import json
-    existing = sets.read_instance(backend, config.instance_id)
+    import uuid
+
+    from ..models import InstanceIdentity
+    from .locks import advisory_lock
+    here = this_host()
+    if config.instance_id_pinned:
+        instance_id = config.instance_id
+    else:
+        with advisory_lock('instance-identity'):
+            conf.forget_recorded_instance()
+            recorded = conf.recorded_instance()
+            if recorded is None:
+                instance_id = str(uuid.uuid4())
+                InstanceIdentity.objects.create(instance_id=instance_id, **here)
+                conf.forget_recorded_instance()
+            else:
+                instance_id = recorded['instance_id']
+    existing = sets.read_instance(backend, instance_id)
     if existing is None:
-        document = {
-            'instance_id': config.instance_id,
-            'hostname': socket.gethostname(),
-            'allowed_hosts': list(getattr(settings, 'ALLOWED_HOSTS', [])),
-            'created': timezone.now().isoformat(),
-            'plugin_version': __version__,
-        }
+        document = {'instance_id': instance_id, **here, 'created': timezone.now().isoformat(),
+                    'plugin_version': __version__}
         try:
-            backend.put_bytes(layout.instance_key(config.instance_id), json.dumps(document, indent=1).encode())
+            backend.put_bytes(layout.instance_key(instance_id), json.dumps(document, indent=1).encode())
         except ObjectExists:
-            existing = sets.read_instance(backend, config.instance_id)
-    if existing is not None and existing.get('instance_id') != config.instance_id:
-        raise BackupError(f"{layout.instance_key(config.instance_id)} belongs to {existing.get('instance_id')}")
+            existing = sets.read_instance(backend, instance_id)
+    if existing is not None:
+        if existing.get('instance_id') != instance_id:
+            raise BackupError(f"{layout.instance_key(instance_id)} belongs to {existing.get('instance_id')}")
+        if not config.instance_id_pinned and not same_install(existing, here):
+            raise BackupError(
+                f"instance_id {instance_id} was recorded by another install ({existing.get('hostname')}, "
+                f"ALLOWED_HOSTS {existing.get('allowed_hosts')}); this looks like a clone or QA copy. Pin a new "
+                f"instance_id in PLUGINS_CONFIG['netbox_backup']"
+            )
+    return instance_id
 
 
 def preflight(config):
@@ -89,7 +127,7 @@ class BackupRunner:
         policy_row = BackupPolicy.objects.get(name=self.policy.name)
         set_id = layout.new_ulid()
         backup_set = BackupSet.objects.create(
-            set_id=set_id, instance_id=self.config.instance_id, policy=policy_row, policy_name=self.policy.name,
+            set_id=set_id, instance_id=self.config.instance_id or '', policy=policy_row, policy_name=self.policy.name,
             status=SetStatusChoices.RUNNING, trigger=self.trigger, created_by=self.created_by,
             started=timezone.now(), netbox_version=settings.VERSION, job=self.job,
         )
@@ -106,11 +144,22 @@ class BackupRunner:
                         f"was never finished. Refusing to back up possibly stale data."
                     )
                 backend = get_backend(self.target)
-                ensure_instance(backend, self.config)
+                probe = targets[self.target.name].last_probe
+                if probe and probe.get('object_checksum') is None and backend.capabilities.object_checksum:
+                    # The last probe saw the server's checksum differ from ours (SSE-KMS, SSE-C): size only
+                    backend.capabilities = backend.capabilities._replace(object_checksum=None)
+                instance_id = ensure_instance(backend, self.config)
+                self.config = dataclasses.replace(self.config, instance_id=instance_id)
+                if backup_set.instance_id != instance_id:
+                    backup_set.instance_id = instance_id
+                    backup_set.save(update_fields=('instance_id',))
                 with Keyring(self.config.crypto, signing=True) as keyring:
                     header, body = self._upload(backend, keyring, db, set_id)
                     raw = manifest.build(header, body, keyring)
+                    lock_name = f'policy:{self.policy.name}'
+                    self._before_visible(lock_conn, lock_name)
                     backend.put_bytes(layout.object_key(self.config.instance_id, set_id, layout.MANIFEST), raw)
+                    self._before_visible(lock_conn, lock_name)
                     backend.put_bytes(layout.object_key(self.config.instance_id, set_id, layout.COMPLETE),
                                       manifest.complete_marker(raw))
                     backup_set.manifest_sha384 = manifest.sha384(raw)
@@ -153,6 +202,16 @@ class BackupRunner:
             f"{self.target.name}"
         )
         return backup_set
+
+    def _before_visible(self, lock_conn, lock_name):
+        """
+        A set becomes visible only while this job still holds its lock and is within max_runtime: past it, the
+        scheduler may already have declared the set failed and freed the policy for the next run.
+        """
+        deadline = self.set.started + self.policy.max_runtime
+        if timezone.now() > deadline:
+            raise BackupError(f"max_runtime ({self.policy.max_runtime}) exceeded; not writing the manifest")
+        assert_held(lock_conn, lock_name)
 
     def _job_data(self):
         if self.job is not None:
@@ -227,8 +286,10 @@ class BackupRunner:
 
         if 'config' in self.components:
             source, summary = components.config_source()
-            record = pipeline.upload_component(keyring, backend, key('config'), source)
-            self.objects[layout.OBJECT_NAMES['config']] = record.as_dict()
+            # The secrets go to the offline recovery key alone: the operational key sits on QA and restore hosts
+            recovery = [self.config.crypto.recovery_key]
+            record = pipeline.upload_component(keyring, backend, key('config'), source, recipients=recovery)
+            self.objects[layout.OBJECT_NAMES['config']] = {**record.as_dict(), 'recipients': recovery}
             self.summaries['config'] = {'files': summary['files'], 'bytes': summary['bytes']}
             for path in summary['missing']:
                 self.warn(f"config: {path} could not be read")
@@ -243,7 +304,8 @@ class BackupRunner:
             'finished_at': now.isoformat(),
             'netbox_version': settings.VERSION,
             'plugin_version': __version__,
-            'recipients': list(self.config.crypto.recipients),
+            'recipients': list(self.config.crypto.all_recipients),
+            'recovery_key': self.config.crypto.recovery_key,
             'signer': self.config.crypto.signing_key,
             'objects': self.objects,
             'components': {

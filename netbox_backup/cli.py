@@ -26,8 +26,9 @@ from datetime import UTC, datetime
 from .core import layout, sets
 from .core import manifest as manifest_mod
 from .core import pg as pgcore
+from .core import secrets as secrets_mod
 from .core.config import Config, ConfigError, parse_duration
-from .core.gpg import GPGError, Keyring
+from .core.gpg import GPGError, Keyring, NoIdentity
 from .storage import StorageError, get_backend
 
 
@@ -37,12 +38,10 @@ def load_config(path):
         data = namespace.get('PLUGINS_CONFIG', {}).get('netbox_backup')
         if data is None:
             raise ConfigError(f"{path} has no PLUGINS_CONFIG['netbox_backup']")
-        seed = namespace.get('SECRET_KEY')
     else:
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
-        seed = None
-    return Config.from_dict(data, fallback_instance_seed=seed)
+    return Config.from_dict(data)
 
 
 def _spool(config):
@@ -105,10 +104,17 @@ def cmd_verify(args, config):
                         if config.crypto.identities:
                             sets.decrypt_file(keyring, path, path + '.plain')
                             results.append({'check': f'{obj_name}: decrypt', 'ok': True, 'detail': ''})
+                    except NoIdentity as e:
+                        if obj_name != layout.OBJECT_NAMES['config']:
+                            results.append({'check': f'{obj_name}: decrypt', 'ok': False, 'detail': str(e)})
+                        else:  # encrypted to the recovery key alone, which is not mounted on an ordinary host
+                            results.append({'check': f'{obj_name}: decrypt', 'ok': True, 'skipped': True,
+                                            'detail': 'skipped: needs the recovery key'})
                     except (sets.SetError, GPGError) as e:
                         results.append({'check': f'{obj_name}: download', 'ok': False, 'detail': str(e)})
     for r in results:
-        print(f"[{'PASS' if r['ok'] else 'FAIL'}] {r['check']}" + (f": {r['detail']}" if r['detail'] else ''))
+        label = 'SKIP' if r.get('skipped') else 'PASS' if r['ok'] else 'FAIL'
+        print(f"[{label}] {r['check']}" + (f": {r['detail']}" if r['detail'] else ''))
     return 0 if all(r['ok'] for r in results) else 1
 
 
@@ -134,9 +140,27 @@ def cmd_decrypt(args, config):
             json.dump(body, f, indent=2)
         components = args.components or [layout.COMPONENT_BY_OBJECT[n] for n in manifest.objects
                                           if n in layout.COMPONENT_BY_OBJECT]
+        optional_config = not args.components and 'config' in components
+        if optional_config:  # without --components, config is decrypted only where the recovery key is mounted
+            components.remove('config')
         paths = sets.fetch_and_decrypt(backend, keyring, manifest, components, args.out)
+        if optional_config:
+            try:
+                paths.update(sets.fetch_and_decrypt(backend, keyring, manifest, ['config'], args.out))
+            except NoIdentity:
+                print("config: skipped (encrypted to the recovery key, which is not mounted here)")
     for component, path in paths.items():
         print(f"{component}: {path}")
+    if args.format == 'env':
+        if 'config' not in paths:
+            raise SystemExit("--format env needs the config component (--components config)")
+        with open(paths['config'], 'rb') as f:
+            lines = secrets_mod.env_lines(secrets_mod.from_config_component(json.loads(f.read())))
+        env_path = os.path.join(args.out, 'secrets.env')
+        fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        print(f"secrets: {env_path} (SECRET_KEY, API_TOKEN_PEPPER_<id>, DB_PASSWORD for the rebuilt host)")
     return 0
 
 
@@ -252,6 +276,8 @@ def build_parser():
     p.add_argument('set', nargs='?', default='latest')
     p.add_argument('--out', required=True)
     p.add_argument('--components', nargs='+', choices=sorted(layout.OBJECT_NAMES))
+    p.add_argument('--format', choices=('files', 'env'), default='files',
+                   help='env also writes the config component\'s secrets as secrets.env (needs the recovery key)')
     p = sub.add_parser('restore-db', help='Load a set into a database without NetBox')
     p.add_argument('set', nargs='?', default='latest')
     p.add_argument('--dsn', required=True, help='postgresql://user@host/dbname (password via PGPASSWORD/.pgpass)')
@@ -269,6 +295,10 @@ def main(argv=None):
         print(f"netbox-backup: {e}", file=sys.stderr)
         return 2
     args.instance = args.instance or config.instance_id
+    if not args.instance and args.command != 'list':
+        print("netbox-backup: instance_id is not pinned in the configuration; pin it or pass --instance",
+              file=sys.stderr)
+        return 2
     handlers = {'list': cmd_list, 'verify': cmd_verify, 'fetch': cmd_fetch, 'decrypt': cmd_decrypt,
                 'restore-db': cmd_restore_db, 'check': cmd_check}
     try:

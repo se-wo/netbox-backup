@@ -56,6 +56,14 @@
           <tr><th scope="row">{% trans "Scheduler last run" %}</th><td>{{ last_tick|isodatetime|placeholder }}</td></tr>
         </table>
       </div>
+      {% if pitr %}
+        <div class="card">
+          <h2 class="card-header">{% trans "Point-in-time recovery (pgBackRest)" %}</h2>
+          <table class="table table-hover">
+            {% for c in pitr %}<tr><td><span class="badge text-bg-{{ c.color }}">{{ c.status|upper }}</span></td><td>{{ c.message }}</td></tr>{% endfor %}
+          </table>
+        </div>
+      {% endif %}
       <div class="card">
         <h2 class="card-header">{% trans "Capacity" %}</h2>
         <table class="table table-hover">

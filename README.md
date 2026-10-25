@@ -31,12 +31,16 @@ cd /opt/netbox/netbox
 ```
 
 Add `PLUGINS = ['netbox_backup']` to `configuration.py`, then create three key pairs: *ops* decrypts restores,
-*recovery* is kept offline, *signing* lives on the worker. Each prints its fingerprint.
+*recovery* is kept offline and alone decrypts the config component with the secrets, *signing* lives on the worker.
+Each prints its fingerprint. Generate the recovery key on an offline machine and bring only its public key here.
 
 ```bash
-for k in ops recovery signing; do python manage.py nbbackup keys generate --name "netbox-backup $k" --out /etc/nbb/$k; done
-cat /etc/nbb/*/*.pub.asc > /etc/nbb/pubkeys.asc
-# Move the ops and recovery secret keys off this host; only the signing key stays.
+python manage.py nbbackup keys generate --role ops --name "netbox-backup ops" --out /etc/nbb/ops
+python manage.py nbbackup keys generate --role signing --name "netbox-backup signing" \
+    --passphrase-env NBB_SIGNING_PASSPHRASE --out /etc/nbb/signing
+# offline: nbbackup keys generate --role recovery --name "netbox-backup recovery" --passphrase-env ... --out /media/usb
+cat /etc/nbb/*/*.pub.asc /media/usb/*.pub.asc > /etc/nbb/pubkeys.asc
+# Move the ops secret key into the secret store; only the signing key stays on this host.
 ```
 
 Then complete the configuration:
@@ -59,9 +63,11 @@ PLUGINS_CONFIG = {
         },
         'crypto': {
             'public_keys': 'file:/etc/nbb/pubkeys.asc',
-            'recipients': ['<ops fingerprint>', '<recovery fingerprint>'],
+            'recipients': ['<ops fingerprint>'],
+            'recovery_key': '<recovery fingerprint>',   # also gets everything; alone gets the config component
             'signing_key': '<signing fingerprint>',
             'signing_secret_key': 'file:/etc/nbb/signing/<signing fingerprint>.sec.asc',
+            'signing_passphrase': 'env:NBB_SIGNING_PASSPHRASE',
             # 'identities': ['file:/run/secrets/nbb_ops.key'],   # mount only for restores
         },
     },

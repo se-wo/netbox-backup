@@ -8,6 +8,12 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "No verified NetBox backup for policy {{ $labels.policy }} in 30 hours"
+      - alert: NetBoxBackupMetricsAbsent
+        expr: absent(netbox_backup_scheduler_last_tick_timestamp_seconds)
+        for: 30m
+        labels: {severity: critical}
+        annotations:
+          summary: "No netbox-backup metrics at all (plugin not loaded, METRICS_ENABLED off, or scrape broken)"
       - alert: NetBoxBackupSchedulerStopped
         expr: time() - netbox_backup_scheduler_last_tick_timestamp_seconds > 15 * 60
         labels: {severity: critical}

@@ -9,7 +9,7 @@ from unittest import mock
 
 import psycopg
 from dcim.models import Site
-from django.core.management import call_command
+from django.core.management import CommandError, call_command
 from django.test import TransactionTestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient
@@ -57,7 +57,7 @@ class InterfaceTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
 
     def test_ui_actions_need_permissions(self):
         policy = BackupPolicy.objects.get()
-        with mock.patch('netbox_backup.views.BackupJob.enqueue') as enqueue:
+        with mock.patch('netbox_backup.jobs.BackupJob.enqueue') as enqueue:
             enqueue.return_value = mock.Mock(pk=1)
             response = self.client.post(reverse('plugins:netbox_backup:backuppolicy_run', kwargs={'pk': policy.pk}))
             self.assertEqual(response.status_code, 302)
@@ -87,7 +87,7 @@ class InterfaceTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
         response = api.patch(reverse('plugins-api:netbox_backup-api:backuppolicy-detail',
                                      kwargs={'pk': BackupPolicy.objects.get().pk}), {'enabled': False})
         self.assertEqual(response.status_code, 405)
-        with mock.patch('netbox_backup.api.views.BackupJob.enqueue') as enqueue:
+        with mock.patch('netbox_backup.jobs.BackupJob.enqueue') as enqueue:
             enqueue.return_value = mock.Mock(pk=7, job_id='x')
             response = api.post(reverse('plugins-api:netbox_backup-api:backuppolicy-run',
                                         kwargs={'pk': BackupPolicy.objects.get().pk}))
@@ -117,9 +117,16 @@ class InterfaceTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
         call_command('nbbackup', 'restore', 'plan', self.set.set_id, '--json', stdout=out)
         self.assertEqual(json.loads(out.getvalue())['strategy'], 'in-place')
         out = io.StringIO()
-        call_command('nbbackup', 'keys', 'generate', '--name', 'test <t@example.com>', '--out',
+        call_command('nbbackup', 'keys', 'generate', '--role', 'ops', '--name', 'test <t@example.com>', '--out',
                      os.path.join(self.tmp, 'keys'), stdout=out)
         self.assertEqual(len(os.listdir(os.path.join(self.tmp, 'keys'))), 2)
+        with self.assertRaisesRegex(CommandError, 'passphrase'):
+            call_command('nbbackup', 'keys', 'generate', '--role', 'recovery', '--name', 'r', '--out',
+                         os.path.join(self.tmp, 'keys2'), stdout=io.StringIO())
+        os.environ['NBB_TEST_PASSPHRASE'] = 'correct horse'
+        call_command('nbbackup', 'keys', 'generate', '--role', 'signing', '--name', 's', '--out',
+                     os.path.join(self.tmp, 'keys3'), '--passphrase-env', 'NBB_TEST_PASSPHRASE', stdout=io.StringIO())
+        self.assertEqual(len(os.listdir(os.path.join(self.tmp, 'keys3'))), 2)
 
     def test_catalog_sync_command(self):
         BackupSet.objects.all().delete()
@@ -161,10 +168,22 @@ class InterfaceTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
         self.assertIn('db.pgdump.enc: decrypt', out)
         code, out = self.run_cli('check', '--max-age', '1h')
         self.assertEqual(code, 0, out)
-        code, out = self.run_cli('decrypt', 'latest', '--out', os.path.join(self.tmp, 'plain'),
-                                 '--components', 'config')
+        self.assertIn('[SKIP] config.json.enc: decrypt', out)  # the ops key can't read the secrets
+        code, out = self.run_cli('decrypt', 'latest', '--out', os.path.join(self.tmp, 'plain'))
         self.assertEqual(code, 0, out)
-        self.assertTrue(os.path.exists(os.path.join(self.tmp, 'plain', 'config.json')))
+        self.assertIn('config: skipped', out)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, 'plain', 'db.pgdump')))
+        self.assertNotEqual(self.run_cli('decrypt', 'latest', '--out', os.path.join(self.tmp, 'plain'),
+                                         '--components', 'config')[0], 0)
+        # Where the recovery key is mounted: the secrets as an env file for the rebuilt host
+        self.configure(crypto=self.crypto_config(identities=('recovery',)))
+        code, out = self.run_cli('decrypt', 'latest', '--out', os.path.join(self.tmp, 'dr'),
+                                 '--components', 'config', '--format', 'env')
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, 'dr', 'config.json')))
+        env = os.path.join(self.tmp, 'dr', 'secrets.env')
+        self.assertEqual(os.stat(env).st_mode & 0o777, 0o600)
+        self.assertIn('SECRET_KEY', open(env).read())
         code, out = self.run_cli('fetch', 'latest', '--out', os.path.join(self.tmp, 'cipher'))
         self.assertEqual(code, 0, out)
         self.assertIn('db.pgdump.enc', os.listdir(os.path.join(self.tmp, 'cipher')))

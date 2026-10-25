@@ -48,7 +48,7 @@ def list_instances(backend):
         parts = info.key.split('/')
         if len(parts) == 2 and parts[1] == layout.INSTANCE_FILE:
             instances.add(parts[0])
-        elif len(parts) > 2 and parts[1] == 'sets':
+        elif len(parts) > 2 and parts[1] in ('sets', 'journal'):
             instances.add(parts[0])
     return sorted(instances)
 
@@ -124,7 +124,9 @@ def level1(backend, manifest, keyring, target=None):
             record(f'{name}: present', False, obj['key'])
             continue
         record(f'{name}: size', info.size == obj['size'], f"{info.size} bytes, expected {obj['size']}")
-        if obj.get('checksum'):
+        if obj.get('checksum') and info.checksum_unavailable:
+            record(f'{name}: checksum', True, f'size only ({info.checksum_unavailable})')
+        elif obj.get('checksum'):
             expected = obj['checksum']['value']
             record(f"{name}: {obj['checksum']['type']}", info.checksum == expected,
                    f"server {info.checksum}, local {expected}")
@@ -181,7 +183,7 @@ def decrypt_file(keyring, src, dest):
     return dest
 
 
-def fetch_and_decrypt(backend, keyring, manifest, components, spool, keep_ciphertext=False):
+def fetch_and_decrypt(backend, keyring, manifest, components, spool, keep_ciphertext=False, keys_used=None):
     """
     Fetch every requested component into spool, verify it, then decrypt it. Returns {component: plaintext path}.
     Every object is downloaded and hash-checked before the first one is decrypted.
@@ -197,6 +199,8 @@ def fetch_and_decrypt(backend, keyring, manifest, components, spool, keep_cipher
     plaintext = {}
     for component, path in fetched.items():
         plaintext[component] = decrypt_file(keyring, path, path.removesuffix('.enc'))
+        if keys_used is not None:
+            keys_used[component] = keyring.last_decryption_key
         if not keep_ciphertext:
             os.unlink(path)
     return plaintext

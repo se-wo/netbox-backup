@@ -22,9 +22,11 @@ snapshots for that layer).
 2. Pick an **off-host target with immutability**: an S3 bucket with object lock (COMPLIANCE default retention, e.g.
    35 days) and a lifecycle rule aborting incomplete uploads after one day, or an Azure container with locked
    version-level immutability. A set on the database's own disk is not a DR backup.
-3. Generate three keys with `nbbackup keys generate`. The **ops** key decrypts restores; keep it in a secret store
-   and mount it only for restores. The **recovery** key goes offline (a printout, a smartcard, a safe), because it is
-   the last way in. The **signing** key stays on the worker.
+3. Generate three keys with `nbbackup keys generate --role ops|signing|recovery`. The **ops** key decrypts
+   restores; keep it in a secret store and mount it only for restores. The **recovery** key is generated offline
+   with a passphrase and stays offline (a printout, a smartcard, a safe): it is the last way in, and the only key
+   that decrypts the config component with `SECRET_KEY`, the token peppers and the database password. The
+   **signing** key (with a passphrase) stays on the worker.
 4. Write the static configuration ([reference](configuration.md)) and **pin `instance_id`**.
 5. Run `manage.py migrate`, start a worker for `netbox_backup.netbox_backup`, then:
 
@@ -33,7 +35,9 @@ snapshots for that layer).
    python manage.py nbbackup run              # the first set; verified at level 1
    ```
 
-6. Keep a copy of the configuration with the ops and recovery keys: it is what a replacement host needs.
+6. Put together the **DR kit** and keep it off this infrastructure (see [the DR kit](backup-and-restore.md#the-dr-kit)):
+   storage credentials, the public keys and fingerprints, the recovery key and its passphrase, the `instance_id`,
+   the direct (not pooled) database DSN, and a NetBox image of the same version with the plugin.
 
 ## 2. Check it
 

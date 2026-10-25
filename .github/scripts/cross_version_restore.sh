@@ -30,19 +30,32 @@ import os
 from netbox_backup_testing import *  # noqa: F401,F403
 
 work = os.environ['NBB_CROSS_WORK']
-keys = sorted(glob.glob(f'{work}/keys/*.pub.asc'))
-fpr = os.path.basename(keys[0]).split('.')[0] if keys else None
+
+
+def key(role):
+    found = glob.glob(f'{work}/keys/{role}/*.pub.asc')
+    return os.path.basename(found[0]).split('.')[0] if found else None
+
+
+ops, signing = key('ops'), key('signing')
+crypto = {}
+if ops and signing:
+    with open(f'{work}/keys/pubkeys.asc', 'wb') as out:
+        for path in glob.glob(f'{work}/keys/*/*.pub.asc'):
+            out.write(open(path, 'rb').read())
+    crypto = {
+        'public_keys': f'file:{work}/keys/pubkeys.asc',
+        'recipients': [ops], 'recovery_key': ops, 'signing_key': signing,
+        'signing_secret_key': f'file:{work}/keys/signing/{signing}.sec.asc',
+        'signing_passphrase': 'env:NBB_CROSS_PASSPHRASE',
+        'identities': [f'file:{work}/keys/ops/{ops}.sec.asc'],
+        'identity_passphrase': 'env:NBB_CROSS_PASSPHRASE',
+    }
 PLUGINS_CONFIG = {
     'netbox_backup': {
         'instance_id': '5f1c2d3e-4b5a-4c6d-8e7f-90a1b2c3d4e5',
         'targets': {'local': {'backend': 'local', 'path': f'{work}/storage'}},
-        'crypto': {
-            'public_keys': f'file:{keys[0]}' if keys else None,
-            'recipients': [fpr] if fpr else [],
-            'signing_key': fpr,
-            'signing_secret_key': f'file:{work}/keys/{fpr}.sec.asc' if fpr else None,
-            'identities': [f'file:{work}/keys/{fpr}.sec.asc'] if fpr else [],
-        },
+        'crypto': crypto,
         'spool_dir': f'{work}/spool',
     },
 }
@@ -84,7 +97,11 @@ createdb "$OLD_DB"
 createdb "$NEW_DB"
 
 echo "::group::Old release: migrate, seed and back up"
-manage old nbbackup keys generate --name 'cross-version <ci@example.com>' --out "$WORK/keys"
+export NBB_CROSS_PASSPHRASE=cross-version-passphrase
+for role in ops signing; do
+    manage old nbbackup keys generate --role "$role" --name "cross-version $role <ci@example.com>" \
+        --out "$WORK/keys/$role" --passphrase-env NBB_CROSS_PASSPHRASE
+done
 manage old migrate --no-input -v0
 manage old shell --no-imports -c "
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site

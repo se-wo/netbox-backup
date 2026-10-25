@@ -15,7 +15,7 @@ from utilities.views import ConditionalLoginRequiredMixin, register_model_view
 from . import conf, filtersets, forms, tables
 from .choices import TriggerChoices
 from .engine import health, scheduler
-from .jobs import QUEUE, BackupJob, VerifyJob
+from .jobs import QUEUE, enqueue_backup, enqueue_verify
 from .models import BackupPolicy, BackupSet, RestoreRun, StorageTarget
 
 
@@ -110,9 +110,8 @@ class BackupPolicyRunView(ConditionalLoginRequiredMixin, View):
         if not request.user.has_perm('netbox_backup.run_backuppolicy'):
             return _deny(request, _('You do not have permission to run backups.'))
         policy = get_object_or_404(BackupPolicy.objects.restrict(request.user, 'view'), pk=pk)
-        job = BackupJob.enqueue(instance=policy, user=request.user, policy=policy.name,
-                                trigger=TriggerChoices.MANUAL, created_by=request.user.username, queue_name=QUEUE,
-                                job_timeout=int(policy.max_runtime.total_seconds()))
+        job = enqueue_backup(policy, trigger=TriggerChoices.MANUAL, user=request.user,
+                             created_by=request.user.username)
         messages.success(request, _('Backup of {policy} queued as job {id}.').format(policy=policy, id=job.pk))
         return redirect('core:job', pk=job.pk)
 
@@ -158,7 +157,7 @@ class BackupSetVerifyView(ConditionalLoginRequiredMixin, View):
         if not request.user.has_perm('netbox_backup.verify_backupset'):
             return _deny(request, _('You do not have permission to verify backup sets.'))
         backup_set = get_object_or_404(BackupSet.objects.restrict(request.user, 'view'), pk=pk)
-        job = VerifyJob.enqueue(user=request.user, set_id=backup_set.set_id, queue_name=QUEUE)
+        job = enqueue_verify(backup_set.set_id, user=request.user)
         messages.success(request, _('Level-1 check of {set} queued as job {id}.').format(set=backup_set, id=job.pk))
         return redirect('core:job', pk=job.pk)
 
@@ -235,4 +234,5 @@ class StatusView(ConditionalLoginRequiredMixin, View):
             'capacity': capacity,
             'restores': RestoreRun.objects.restrict(request.user, 'view')[:5],
             'last_tick': scheduler.last_tick(),
+            'pitr': health.pitr_conditions(),
         })

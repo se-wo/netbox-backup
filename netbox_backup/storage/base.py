@@ -55,6 +55,8 @@ class ObjectInfo:
     last_modified: datetime | None = None
     is_latest: bool = True
     delete_marker: bool = False
+    # Why the backend's checksum can't be compared for this object (e.g. SSE-KMS); level 1 is then size only
+    checksum_unavailable: str | None = None
 
 
 @dataclass

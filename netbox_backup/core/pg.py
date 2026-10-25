@@ -95,6 +95,23 @@ class Database:
             shutil.rmtree(directory, ignore_errors=True)
 
 
+def pooled_session(conn, transactions=3):
+    """
+    Why this autocommit connection is not a dedicated server session, or None. Behind a transaction-mode pooler
+    (PgBouncer, e.g. Azure Flexible Server's port 6432) session advisory locks and exported snapshots would leak
+    onto, or vanish with, a shared server connection; the pooler shows itself by a backend PID that changes
+    between transactions.
+    """
+    pids = []
+    with conn.cursor() as cursor:
+        for _ in range(transactions):
+            cursor.execute('SELECT pg_backend_pid()')
+            pids.append(cursor.fetchone()[0])
+    if len(set(pids)) > 1:
+        return f"the backend PID changed between transactions ({' -> '.join(map(str, pids))}): a connection pooler"
+    return None
+
+
 def server_major(conn):
     return conn.info.server_version // 10000
 
@@ -182,14 +199,16 @@ def owned_schemas(cursor):
 def baseline(cursor):
     """
     Row count per table, plus per-schema counts of indexes, constraints and triggers, and the newest last_updated
-    of every table that has one. Taken with raw SQL inside the dump's snapshot.
+    of every table that has one. Taken with raw SQL inside the dump's snapshot. Tables are relkind 'r' only (leaf
+    partitions included, partitioned parents not), in every non-system schema (netbox-branching's too), which is
+    exactly what pg_dump emits COPY data for, so the dump check compares like with like.
     """
     cursor.execute("""
         SELECT n.nspname, c.relname,
                EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attname = 'last_updated'
                        AND NOT a.attisdropped)
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
+        WHERE c.relkind = 'r'
           AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_'
         ORDER BY 1, 2
     """)
@@ -386,15 +405,35 @@ def set_slot_marker(conn, dbname, marked):
 
 def is_empty(conn):
     """
-    True if the database holds no user tables, views or sequences.
+    True if the database holds no relations in any non-system schema (checked in pg_class/pg_namespace, which
+    information_schema would hide for objects we lack privileges on) and no extension other than plpgsql.
     """
     with conn.cursor() as cursor:
         cursor.execute("""
-            SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
-              AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_'
+            SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_')
+                 + (SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql')
         """)
         return cursor.fetchone()[0] == 0
+
+
+def newest_change(cursor):
+    """
+    The newest last_updated across every table that has one, or None.
+    """
+    cursor.execute("""
+        SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'last_updated' AND NOT a.attisdropped
+        WHERE c.relkind IN ('r', 'p') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname !~ '^pg_'
+    """)
+    newest = None
+    for schema, table in cursor.fetchall():
+        cursor.execute(sql.SQL('SELECT max(last_updated) FROM {}').format(sql.Identifier(schema, table)))
+        value = cursor.fetchone()[0]
+        if value is not None and (newest is None or value > newest):
+            newest = value
+    return newest
 
 
 def foreign_owned(cursor):
@@ -440,6 +479,20 @@ def empty_database(conn, lock_timeout='10s'):
             if cursor.fetchone()[0]:
                 cursor.execute(sql.SQL('CREATE SCHEMA public AUTHORIZATION {}').format(sql.Identifier(user)))
                 cursor.execute('GRANT USAGE ON SCHEMA public TO PUBLIC')
+
+
+def acl_statements(db, path, roles):
+    """
+    The GRANT, REVOKE and ALTER DEFAULT PRIVILEGES lines of a dump that name one of roles: what a load with
+    --no-privileges drops, so the operator can re-apply them once the roles exist.
+    """
+    result = subprocess.run([db.binary('pg_restore'), '--schema-only', '--file=-', path], capture_output=True,
+                            check=False)
+    if result.returncode != 0:
+        return []
+    pattern = re.compile(r'\b(?:{})\b'.format('|'.join(re.escape(r) for r in roles)))
+    return [line for line in result.stdout.decode(errors='replace').splitlines()
+            if line.startswith(('GRANT ', 'REVOKE ', 'ALTER DEFAULT PRIVILEGES ')) and pattern.search(line)]
 
 
 def restore_args(db, path, jobs=1, no_privileges=False):

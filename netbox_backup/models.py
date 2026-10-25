@@ -21,7 +21,27 @@ from .choices import (
     VerifyLevelChoices,
 )
 
-__all__ = ('BackupCopy', 'BackupPolicy', 'BackupSet', 'RestoreRun', 'StorageTarget', 'register_actions')
+__all__ = (
+    'BackupCopy', 'BackupPolicy', 'BackupSet', 'InstanceIdentity', 'RestoreRun', 'StorageTarget', 'register_actions',
+)
+
+
+class InstanceIdentity(models.Model):
+    """
+    The random instance_id an install without a pinned one chose on its first backup, with the host details
+    recorded beside it in <instance_id>/instance.json.
+    """
+    instance_id = models.CharField(verbose_name=_('instance'), max_length=36, unique=True)
+    hostname = models.CharField(verbose_name=_('hostname'), max_length=255, blank=True)
+    allowed_hosts = models.JSONField(verbose_name=_('allowed hosts'), default=list, blank=True)
+    created = models.DateTimeField(verbose_name=_('created'), auto_now_add=True)
+
+    class Meta:
+        verbose_name = _('instance identity')
+        verbose_name_plural = _('instance identities')
+
+    def __str__(self):
+        return self.instance_id
 
 
 class StorageTarget(NetBoxModel):
@@ -119,6 +139,10 @@ class BackupSet(models.Model):
     )
     verified_at = models.DateTimeField(verbose_name=_('verified'), null=True, blank=True)
     qa_passed_at = models.DateTimeField(verbose_name=_('QA restore passed'), null=True, blank=True)
+    recovery_drill_at = models.DateTimeField(
+        verbose_name=_('recovery-key drill passed'), null=True, blank=True,
+        help_text=_('A drill that decrypted the set with the offline recovery key'),
+    )
     expired_at = models.DateTimeField(verbose_name=_('expired'), null=True, blank=True)
     job = models.ForeignKey(
         to='core.Job', on_delete=models.SET_NULL, related_name='+', null=True, blank=True, editable=False,

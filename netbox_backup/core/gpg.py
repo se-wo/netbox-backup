@@ -24,17 +24,24 @@ import threading
 
 from .config import read_reference_bytes, resolve_secret
 
-__all__ = ('GPGError', 'Keyring', 'generate_key')
+__all__ = ('GPGError', 'Keyring', 'NoIdentity', 'generate_key')
 
 AES256 = '9'
 SHA384 = '9'
 BRAINPOOL_CURVES = {'brainpoolP256r1', 'brainpoolP384r1', 'brainpoolP512r1'}
 ALGO_RSA = {'1', '2', '3'}
 ALGO_ECC = {'18', '19'}  # ECDH, ECDSA
+SIGNATURE_ALGOS = {'19', '1', '3'}  # ECDSA, RSA (key sizes are held to the profile at import)
 
 
 class GPGError(Exception):
     pass
+
+
+class NoIdentity(GPGError):
+    """
+    None of the mounted identities is a recipient of the object (e.g. the config component without the recovery key).
+    """
 
 
 class StatusReader(threading.Thread):
@@ -106,7 +113,8 @@ class Keyring:
 
     def __init__(self, crypto, signing=False, identities=False, extra_signers=()):
         if not crypto.configured:
-            raise GPGError("crypto is not configured: public_keys, recipients and signing_key are required")
+            raise GPGError("crypto is not configured: public_keys, recipients, recovery_key and signing_key are "
+                           "required")
         self.crypto = crypto
         self.binary = shutil.which(crypto.gpg_binary)
         if not self.binary:
@@ -115,6 +123,7 @@ class Keyring:
         os.chmod(self.home, 0o700)
         self.signers = {crypto.signing_key, *crypto.trusted_signers, *extra_signers}
         self.passphrase_file = None
+        self.last_decryption_key = None
         try:
             self._setup(signing, identities)
         except BaseException:
@@ -188,7 +197,7 @@ class Keyring:
                 raise GPGError("No decryption identity is mounted (crypto.identities)")
             for ref in self.crypto.identities:
                 self._import_secret(ref, self.crypto.identity_passphrase)
-        pinned = set(self.crypto.recipients) | self.signers
+        pinned = set(self.crypto.all_recipients) | self.signers
         keys = self.list_keys()
         # Keep only pinned keys, so a stray key in the public key file can never be used
         for fpr in set(keys) - pinned:
@@ -201,7 +210,7 @@ class Keyring:
             problems = self.profile_problems(keys[fpr])
             if problems:
                 raise GPGError(f"Key {fpr} does not meet the '{self.profile}' algorithm profile: {problems}")
-        for fpr in self.crypto.recipients:
+        for fpr in self.crypto.all_recipients:
             if not any('e' in sub['caps'] for sub in keys[fpr]['subkeys']) and 'e' not in keys[fpr]['caps']:
                 raise GPGError(f"Recipient key {fpr} has no encryption-capable (sub)key")
         if signing and not keys[self.crypto.signing_key]['secret']:
@@ -267,9 +276,9 @@ class Keyring:
 
     def profile_problems(self, key):
         problems = []
+        # Every (sub)key counts, revoked and expired ones too: gpg picks the newest usable encryption subkey on
+        # its own, so a key passes only if no subkey it could ever pick is outside the profile
         for k in [key, *key['subkeys']]:
-            if k['validity'] in ('r', 'e', 'd', 'i'):
-                continue  # revoked/expired subkeys are never used
             if k['algo'] in ALGO_ECC and k['curve'] in BRAINPOOL_CURVES:
                 continue
             if k['algo'] in ALGO_RSA and k['length'] >= 3072:
@@ -279,15 +288,19 @@ class Keyring:
 
     # Operations
 
-    def encrypt_args(self):
+    def encrypt_args(self, recipients=None):
         args = ['--encrypt', '--compress-algo', 'none', '--cipher-algo', 'AES256', '--digest-algo', 'SHA384',
                 '--no-encrypt-to', '--output', '-']
-        for fpr in self.crypto.recipients:
+        for fpr in recipients or self.crypto.all_recipients:
             args += ['--recipient', fpr]
         return args
 
-    def encrypt_process(self, stdin=subprocess.PIPE, stdout=subprocess.PIPE):
-        return self.spawn(self.encrypt_args(), stdin=stdin, stdout=stdout)
+    def encrypt_process(self, stdin=subprocess.PIPE, stdout=subprocess.PIPE, recipients=None):
+        """
+        recipients defaults to the operational keys plus the recovery key; the config component passes the recovery
+        key alone.
+        """
+        return self.spawn(self.encrypt_args(recipients), stdin=stdin, stdout=stdout)
 
     @staticmethod
     def check_encryption(proc):
@@ -299,8 +312,8 @@ class Keyring:
             raise GPGError(f"gpg did not encrypt with AES-256 (BEGIN_ENCRYPTION {begin})")
         return status
 
-    def encrypt_bytes(self, data):
-        proc = self.encrypt_process()
+    def encrypt_bytes(self, data, recipients=None):
+        proc = self.encrypt_process(recipients=recipients)
         output, _ = proc.popen.communicate(data)
         self.check_encryption(proc)
         return output
@@ -308,16 +321,16 @@ class Keyring:
     def decrypt_process(self, stdin=subprocess.PIPE, stdout=subprocess.PIPE):
         return self.spawn(self.secret_args() + ['--decrypt', '--output', '-'], stdin=stdin, stdout=stdout)
 
-    @staticmethod
-    def check_decryption(proc):
+    def check_decryption(self, proc):
         """
         gpg emits plaintext before its integrity check finishes; only after this returns may the output be used.
+        Records the primary fingerprint of the key that decrypted in last_decryption_key.
         """
         status = proc.wait()
         if proc.returncode != 0 or not status.has('DECRYPTION_OKAY') or status.has('DECRYPTION_FAILED'):
             if status.has('NO_SECKEY') and not status.has('DECRYPTION_OKAY'):
                 recipients = ', '.join(parts[0] for parts in status.get('ENC_TO'))
-                raise GPGError(f"No mounted identity matches a recipient of this object (encrypted to {recipients})")
+                raise NoIdentity(f"No mounted identity matches a recipient of this object (encrypted to {recipients})")
             raise proc.error('decryption')
         info = status.get('DECRYPTION_INFO')
         if not info or info[0][1] != AES256:
@@ -325,6 +338,8 @@ class Keyring:
         aead = len(info[0]) > 2 and info[0][2] not in ('', '0')
         if not aead and not status.has('GOODMDC'):
             raise GPGError("Object has no integrity protection (no MDC/AEAD)")
+        used = status.get('DECRYPTION_KEY')
+        self.last_decryption_key = used[0][1] if used and len(used[0]) > 1 else None
         return status
 
     def decrypt_bytes(self, data):
@@ -363,14 +378,22 @@ class Keyring:
             status = proc.wait()
         finally:
             os.unlink(sig_path)
-        valid = status.get('VALIDSIG')
-        if proc.returncode != 0 or len(valid) != 1 or status.has('BADSIG') or status.has('ERRSIG'):
-            raise GPGError("Signature verification failed" + (f": {proc.stderr.splitlines()[-1]}"
-                                                               if proc.stderr else ''))
+        detail = f": {proc.stderr.splitlines()[-1]}" if proc.stderr else ''
+        # Exactly one signature; VALIDSIG alone is also emitted for expired and revoked keys, so GOODSIG must
+        # vouch for the same signature, and no expired/revoked/bad variant may appear
+        refused = [k for k in ('BADSIG', 'ERRSIG', 'EXPSIG', 'EXPKEYSIG', 'REVKEYSIG') if status.has(k)]
+        newsig, good, valid = status.get('NEWSIG'), status.get('GOODSIG'), status.get('VALIDSIG')
+        if proc.returncode != 0 or refused or len(newsig) != 1 or len(good) != 1 or len(valid) != 1:
+            reason = f" ({', '.join(refused)})" if refused else ''
+            raise GPGError(f"Signature verification failed{reason}{detail}")
         fields = valid[0]
-        primary = fields[9] if len(fields) > 9 and fields[9] else fields[0]
+        signing_key, primary = fields[0], (fields[9] if len(fields) > 9 and fields[9] else fields[0])
+        if not signing_key.endswith(good[0][0]):
+            raise GPGError("GOODSIG and VALIDSIG name different keys")
         if primary not in allowed:
             raise GPGError(f"Signed by {primary}, which is not a pinned signer")
+        if fields[6] not in SIGNATURE_ALGOS:
+            raise GPGError(f"Signature uses public-key algorithm {fields[6]}, not ECDSA or RSA")
         if fields[7] != SHA384:
             raise GPGError(f"Signature uses hash algorithm {fields[7]}, not SHA-384")
         return primary

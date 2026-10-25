@@ -7,7 +7,13 @@
 | `RNG is not compliant with --compliance=de-vs mode` | `compliance: 'de-vs'` with a stock GnuPG/libgcrypt | Remove `compliance` (the BSI algorithm profile still applies) or install a de-vs compliant GnuPG build |
 | `Key ... does not meet the 'bsi' algorithm profile` | A pinned key uses Ed25519/Curve25519 or RSA < 3072 | Generate keys with `nbbackup keys generate` (brainpoolP384r1) |
 | `Pinned key(s) not found in crypto.public_keys` | The key file lacks a recipient or the signing key | Rebuild the bundle: `cat */*.pub.asc > pubkeys.asc` |
-| `No mounted identity matches a recipient` | Restore without the ops or recovery key mounted | Mount it and list it in `crypto.identities` |
+| `No mounted identity matches a recipient` | Restore without the ops or recovery key mounted; or the config component, which only the recovery key opens | Mount the key and list it in `crypto.identities`; the config component needs the recovery key |
+| `backend PID changed between transactions: a connection pooler` | NetBox's database connection goes through PgBouncer (e.g. Azure Flexible Server port 6432) | Set `direct_connection: {'port': 5432}` (or the direct host) in the plugin config |
+| `max_runtime ... exceeded; not writing the manifest` / `no longer holds the lock` | The backup ran longer than its policy's `max_runtime`, or the scheduler reclaimed its lock | Raise `max_runtime`, or find what made the job slow; the incomplete set is collected later |
+| `instance_id ... was recorded by another install` | An unpinned clone or QA copy restored from another install | Pin a new `instance_id` on this install |
+| Level 1 says "size only" on S3 | The bucket uses SSE-KMS or SSE-C, whose ETag is not an MD5 | Expected; sizes, SHA-384 on read and signatures still apply. `target probe` reports it |
+| Prune reports a policy as held | The policy's newest sets are all unverified | Fix the verification failure (`nbbackup verify`); prune resumes once a set verifies |
+| `keys generate` refuses without `--passphrase-env` | Recovery and signing keys need a passphrase | Pass `--passphrase-env VAR` (or keep the key on a smartcard) |
 | `crypto is not configured` | No `crypto` block | There is no unencrypted mode; configure keys |
 | Media warning on every set | Files referenced in the database are missing from storage | Check `media_missing` in the set; restore those files from an older set (`restore media`) |
 | `the database references N file(s) but the storage is empty` | The media volume is not mounted in the worker | Mount it, or point `STORAGES['default']` at the right place |

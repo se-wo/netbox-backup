@@ -27,7 +27,7 @@ class BackupCollector:
         from . import conf
         from .choices import SetStatusChoices
         from .engine import scheduler
-        from .models import BackupCopy, BackupSet, StorageTarget
+        from .models import BackupCopy, BackupPolicy, BackupSet, StorageTarget
 
         config = conf.get_config()
         now = timezone.now()
@@ -37,9 +37,16 @@ class BackupCollector:
                                     'Finish time of the newest verified set', labels=['policy', 'target'])
         rows = BackupCopy.objects.filter(set__in=usable, verify_level__gte=1).values(
             'set__policy_name', 'target__name').annotate(last=Max('set__finished'))
+        seen = set()
         for row in rows:
             if row['last']:
                 success.add_metric([row['set__policy_name'], row['target__name']], row['last'].timestamp())
+                seen.add(row['set__policy_name'])
+        # A policy without a verified set yet reports its creation time, so "no success within the interval"
+        # fires on a fresh install whose first backup never succeeds
+        for policy in BackupPolicy.objects.filter(enabled=True).exclude(name__in=seen).select_related(
+                'primary_target'):
+            success.add_metric([policy.name, policy.primary_target.name], policy.created.timestamp())
         yield success
 
         verified = GaugeMetricFamily('netbox_backup_last_verified_timestamp_seconds',

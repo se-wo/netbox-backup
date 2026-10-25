@@ -278,11 +278,17 @@ class S3Backend(StorageBackend):
             head = self.call(self.client.head_object, Bucket=self.bucket, Key=self.full_key(key))
         except ObjectNotFound:
             return None
-        return ObjectInfo(
+        info = ObjectInfo(
             key=key, size=head['ContentLength'], checksum=head.get('ETag', '').strip('"') or None,
             version=head.get('VersionId'), retain_until=head.get('ObjectLockRetainUntilDate'),
             last_modified=head.get('LastModified'),
         )
+        # Under SSE-KMS (also the bucket default) and SSE-C the ETag is not derived from MD5
+        sse = head.get('ServerSideEncryption') or ''
+        if sse.startswith('aws:kms') or head.get('SSECustomerAlgorithm'):
+            info.checksum = None
+            info.checksum_unavailable = f"server-side encryption {sse or 'SSE-C'}: the ETag is not an MD5"
+        return info
 
     def list(self, prefix, include_versions=False):
         full_prefix = self.full_key(prefix) if prefix else (self.target.prefix + '/' if self.target.prefix else '')
@@ -396,4 +402,26 @@ class S3Backend(StorageBackend):
             f"AbortIncompleteMultipartUpload after {report.abort_incomplete_days or 'never'} day(s); expected 1",
         )
         self._probe_roundtrip(report, self.probe_key(under))
+        self._probe_multipart(report, under)
         return report
+
+    def _probe_multipart(self, report, under):
+        """
+        A real two-part upload with the target's own encryption settings: if the server's ETag differs from the one
+        computed locally (SSE-KMS, SSE-C, a store with other ETag rules), level-1 checks on this target are size only.
+        """
+        key = self.probe_key(under) + '-multipart'
+        try:
+            with self.open_write(key) as writer:
+                writer.write(b'\0' * (MIN_PART + 1))
+                written = writer.commit()
+        except StorageError as e:
+            report.check('multipart upload', False, str(e))
+            return
+        info = self.stat(key)
+        matches = info is not None and info.checksum is not None and info.checksum == written.checksum
+        if not matches:
+            report.object_checksum = None
+        report.check('multipart ETag matches the local MD5', matches,
+                     '' if matches else (info.checksum_unavailable if info else 'object missing')
+                     or 'level-1 checks on this target are size only', required=False)

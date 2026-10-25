@@ -163,13 +163,13 @@ class ObjectRecord:
         }
 
 
-def upload_component(keyring, backend, key, source, size_hint=None, taps=()):
+def upload_component(keyring, backend, key, source, size_hint=None, taps=(), recipients=None):
     """
     Stream source through gpg into backend at key. Returns an ObjectRecord. taps receive every plaintext chunk via
     write() and are asked finish() before commit; either may raise to fail the object.
     """
     writer = backend.open_write(key, size_hint=size_hint)
-    gpg = keyring.encrypt_process()
+    gpg = keyring.encrypt_process(recipients=recipients)
     plaintext = {'size': 0, 'error': None}
     stream = None
 

@@ -50,16 +50,35 @@ def archive_members(path):
     return names
 
 
-def snapshot_storage(component, dest):
+def snapshot_storage(component, dest, keyring):
     """
-    A local zstd tarball of the storage's current files (the safety copy). Returns the file count.
+    The safety copy of the storage's current files: a zstd tarball, gpg-encrypted to the set recipients, so nothing
+    sits on the spool in plaintext until finalize. Returns the file count.
     """
     tree = components.StorageTree(component, ())
-    with open(dest, 'wb') as out:
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'wb') as out:
+        gpg = keyring.encrypt_process(stdout=out)
         stream = tree.source.open()
-        shutil.copyfileobj(stream, out, 1024 * 1024)
+        try:
+            shutil.copyfileobj(stream, gpg.stdin, 1024 * 1024)
+        finally:
+            gpg.stdin.close()
         tree.source.close()
+        keyring.check_encryption(gpg)
     return tree.source.files
+
+
+def restore_encrypted_archive(component, path, restore_id, keyring, log=None):
+    """
+    Decrypt an encrypted safety copy into a temporary file, write it back, and remove the plaintext again.
+    """
+    from ..core import sets
+    plain = sets.decrypt_file(keyring, path, path.removesuffix('.enc'))
+    try:
+        return restore_archive(component, plain, restore_id, log=log)
+    finally:
+        os.unlink(plain)
 
 
 def _write(storage, name, fileobj):

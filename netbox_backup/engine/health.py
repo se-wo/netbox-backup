@@ -53,8 +53,11 @@ def conditions(now=None, check_workers=True):
     if problems:
         return result
     config = conf.get_config()
-    if not config.instance_id_pinned:
-        result.append(Condition('InstancePinned', WARNING, f"instance_id is derived from SECRET_KEY; pin "
+    if not config.instance_id_pinned and config.instance_id is None:
+        result.append(Condition('InstancePinned', WARNING, "instance_id is not pinned and no backup has chosen one "
+                                                           "yet; pin one (uuidgen) for disaster recovery"))
+    elif not config.instance_id_pinned:
+        result.append(Condition('InstancePinned', WARNING, f"instance_id is not pinned; pin "
                                                            f"'instance_id': '{config.instance_id}' for disaster "
                                                            f"recovery"))
     if not config.crypto.configured:
@@ -146,10 +149,15 @@ def conditions(now=None, check_workers=True):
     except Exception:
         pass
 
-    pitr = pgbackrest.condition()
-    if pitr is not None:
-        result.append(pitr)
     return result
+
+
+def pitr_conditions():
+    """
+    pgBackRest stanza health, reported beside "Backup health" rather than inside it: the database host owns it.
+    """
+    pitr = pgbackrest.condition()
+    return [pitr] if pitr is not None else []
 
 
 def overall(conds):
@@ -158,4 +166,5 @@ def overall(conds):
 
 def summary(now=None, check_workers=True):
     conds = conditions(now=now, check_workers=check_workers)
-    return {'status': overall(conds), 'conditions': [c.as_dict() for c in conds]}
+    return {'status': overall(conds), 'conditions': [c.as_dict() for c in conds],
+            'pitr': [c.as_dict() for c in pitr_conditions()]}

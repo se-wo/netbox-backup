@@ -62,6 +62,7 @@ class Command(BaseCommand):
         p = sub.add_parser('list', help='List sets in storage (no database needed)')
         p.add_argument('--target')
         p.add_argument('--instance')
+        p.add_argument('--all-instances', action='store_true', help='Every instance found on the targets')
         p.add_argument('--json', action='store_true')
 
         p = sub.add_parser('show', help='Show a set')
@@ -130,6 +131,8 @@ class Command(BaseCommand):
         p = sub.add_parser('keys', help='Key management')
         keys = p.add_subparsers(dest='keys_action', required=True)
         q = keys.add_parser('generate', help='Generate a brainpoolP384r1 key pair')
+        q.add_argument('--role', required=True, choices=('ops', 'recovery', 'signing'),
+                       help='recovery and signing keys need --passphrase-env; generate the recovery key offline')
         q.add_argument('--name', required=True, help='User ID, e.g. "netbox-backup ops <ops@example.com>"')
         q.add_argument('--out', required=True, help='Directory for <fingerprint>.pub.asc and .sec.asc')
         q.add_argument('--passphrase-env', help='Environment variable holding the passphrase')
@@ -172,13 +175,11 @@ class Command(BaseCommand):
         policy = self._policy(options.get('policy'))
         if options.get('background'):
             from ...engine import catalog
-            from ...jobs import QUEUE, BackupJob
+            from ...jobs import enqueue_backup
             from ...models import BackupPolicy
             catalog.sync_static()
-            row = BackupPolicy.objects.get(name=policy)
-            job = BackupJob.enqueue(instance=row, policy=policy, trigger=trigger, created_by=self._user(),
-                                    components=options.get('components'), queue_name=QUEUE,
-                                    job_timeout=int(row.max_runtime.total_seconds()))
+            job = enqueue_backup(BackupPolicy.objects.get(name=policy), trigger=trigger, created_by=self._user(),
+                                 components=options.get('components'))
             self.stdout.write(f"Enqueued job {job.pk}")
             return
         from ...engine.backup import run_backup
@@ -201,18 +202,21 @@ class Command(BaseCommand):
             if options.get('target') and name != options['target']:
                 continue
             backend = get_backend(target)
-            for listing in sets.list_sets(backend, instance):
-                rows.append({'target': name, 'set_id': listing.set_id, 'created': listing.created.isoformat(),
-                             'complete': listing.complete, 'size_bytes': listing.size,
-                             'objects': sorted(listing.objects)})
+            instances = sets.list_instances(backend) if options.get('all_instances') else [i for i in [instance] if i]
+            for instance_id in instances:
+                for listing in sets.list_sets(backend, instance_id):
+                    rows.append({'target': name, 'instance': instance_id, 'set_id': listing.set_id,
+                                 'created': listing.created.isoformat(),
+                                 'complete': listing.complete, 'size_bytes': listing.size,
+                                 'objects': sorted(listing.objects)})
         if options.get('json'):
             self.stdout.write(json.dumps(rows, indent=2))
             return
-        self.stdout.write(f"{'SET':<27} {'TARGET':<16} {'CREATED':<20} {'SIZE':>10}  STATE")
+        self.stdout.write(f"{'SET':<27} {'INSTANCE':<37} {'TARGET':<16} {'CREATED':<20} {'SIZE':>10}  STATE")
         for row in rows:
             state = 'complete' if row['complete'] else 'incomplete'
-            self.stdout.write(f"{row['set_id']:<27} {row['target']:<16} {row['created'][:19]:<20} "
-                              f"{human_size(row['size_bytes']):>10}  {state}")
+            self.stdout.write(f"{row['set_id']:<27} {row['instance']:<37} {row['target']:<16} "
+                              f"{row['created'][:19]:<20} {human_size(row['size_bytes']):>10}  {state}")
 
     def do_show(self, options):
         from ...engine.restore import locate
@@ -266,6 +270,8 @@ class Command(BaseCommand):
                 self.stdout.write(f"  - {set_id}{done}")
             for set_id, until in report.locked.items():
                 self.stdout.write(f"  ~ {set_id} locked until {until}")
+            for policy, reason in report.held.items():
+                self.stdout.write(self.style.WARNING(f"  ~ policy {policy} held: {reason}"))
             for set_id in report.waiting_for_replicas:
                 self.stdout.write(f"  ~ {set_id} waits for its replicas")
             self.stdout.write(f"  kept {len(report.keep)} set(s)")
@@ -368,8 +374,15 @@ class Command(BaseCommand):
         catalog.sync_static(config)
         names = [options['name']] if options.get('name') else list(config.targets)
         failed = False
+        from ...engine import locks
+        try:
+            locks.connect().close()
+            self.stdout.write("database: OK (a dedicated session, no transaction pooler)")
+        except locks.PooledConnection as e:
+            failed = True
+            self.stdout.write(self.style.ERROR(f"database: FAILED: {e}"))
         for name in names:
-            report = get_backend(config.target(name)).probe(under=config.instance_id)
+            report = get_backend(config.target(name)).probe(under=config.instance_id or '')
             StorageTarget.objects.filter(name=name).update(last_probe=report.as_dict(), last_probe_at=timezone.now())
             self.stdout.write(f"{name}: {'OK' if report.ok else 'FAILED'}")
             for c in report.checks:
@@ -382,6 +395,11 @@ class Command(BaseCommand):
     def do_keys(self, options):
         from ...core.gpg import generate_key
         passphrase = os.environ.get(options['passphrase_env'], '') if options.get('passphrase_env') else ''
+        if options['role'] in ('recovery', 'signing') and not passphrase:
+            raise CommandError(
+                f"A {options['role']} key must be passphrase-protected: pass --passphrase-env VAR with the passphrase "
+                f"in VAR (or move the key to a smartcard with gpg --edit-key ... keytocard)"
+            )
         config = conf.get_config()
         fpr, public, secret = generate_key(options['name'], gpg_binary=config.crypto.gpg_binary,
                                            passphrase=passphrase)
@@ -404,4 +422,6 @@ class Command(BaseCommand):
                 style = {'error': self.style.ERROR, 'warning': self.style.WARNING}.get(c['status'], str)
                 subject = f" [{c['subject']}]" if c['subject'] else ''
                 self.stdout.write(style(f"{c['status'].upper():<8} {c['name']}{subject}: {c['message']}"))
+            for c in summary['pitr']:
+                self.stdout.write(f"PITR     {c['status'].upper()} {c['name']}: {c['message']}")
         sys.exit({'ok': 0, 'info': 0, 'warning': 1, 'error': 2}[summary['status']])

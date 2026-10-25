@@ -20,9 +20,14 @@ Design rules:
   signed manifest headers, and it runs after every restore.
 * **Static config wins.** Targets, policies, recipients, the signing key and secret references live only in
   `PLUGINS_CONFIG` and work before the database exists.
-* **One lock, one writer.** A PostgreSQL advisory lock per policy, on its own connection, prevents concurrent jobs.
-  It is released the instant a worker dies. Each install writes only below its own `instance_id`, and
-  `instance.json` is created with a create-only write.
+* **One lock, one writer.** A PostgreSQL advisory lock per policy, on its own direct connection with TCP keepalives,
+  prevents concurrent jobs. It is released the instant a worker dies. A session through a transaction-mode pooler
+  (PgBouncer) is detected by a backend PID that changes between transactions and refused; set `direct_connection`.
+  The job re-checks that it still holds the lock, and that it is within `max_runtime`, right before it writes the
+  manifest and again before `_COMPLETE`. Each install writes only below its own `instance_id`, and `instance.json`
+  is created with a create-only write.
+* **Every job carries its own RQ timeout.** RQ's default of 300 s would kill any backup longer than five minutes:
+  a backup gets its policy's `max_runtime`, prune the longest `max_runtime` (at least 1 h), verify 1 h.
 * **No schema surgery.** The plugin dumps NetBox's database and loads dumps into an empty one. It never renames,
   alters or edits NetBox's tables, schemas or extensions.
 
@@ -37,8 +42,12 @@ Design rules:
 
 The config component holds the configuration files **verbatim, including `SECRET_KEY`, `API_TOKEN_PEPPERS` and the
 database password**. A replacement host can be rebuilt from a set and the recovery key alone. The object is
-encrypted to the ops and recovery keys like everything else. A set already contains every password hash and token,
-so it must be protected like production either way.
+encrypted to the **recovery key only**: hosts with the ops key (QA restores, drills, `verify --deep`) restore the
+database, media and scripts and skip it. `netbox-backup decrypt <set> --components config --format env` (with the
+recovery key) also writes the secrets as a 0600 `secrets.env` (`SECRET_KEY`, `API_TOKEN_PEPPER_<id>`,
+`DB_PASSWORD`) for the rebuilt host, and `restore finish` reports, by name only, which secrets differ from the
+running configuration where the recovery key is mounted. A set already contains every password hash and token, so
+it must be protected like production either way.
 
 Data-source content lives in the database and is covered by the dump. Server-wide objects such as roles are never
 dumped, because a shared server's roles are not NetBox's to restore. `static` is not backed up, because
@@ -59,12 +68,14 @@ the storage is empty, the set fails: the volume is probably not mounted.
 <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/scripts.tar.zst.enc
 <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/config.json.enc
 <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/_COMPLETE
-<prefix>/<instance_id>/journal/<restore_id>/<NNN>-<step>.json
+<prefix>/<source instance_id>/journal/<restore_id>/<NNN>-<step>.json
 <prefix>/<instance_id>/.probe/<timestamp>-<id>
 ```
 
 `set_id` is a ULID, so keys sort by time on every backend. A set becomes visible only when `_COMPLETE` is written,
-after everything else, so no backend needs atomic multi-object writes.
+after everything else, so no backend needs atomic multi-object writes. A signed manifest with a matching
+`_COMPLETE` is authoritative: catalog sync adopts it even if the database recorded that set as failed. Journals live
+below the instance the restored set came from; each step is a new create-only object with the next free `NNN`.
 
 ### Manifest
 
@@ -104,11 +115,14 @@ The plugin contains no cryptographic code of its own. gpg runs as a subprocess w
 holding only the pinned keys. It always gets `--batch` and `--status-fd`, never retrieves keys automatically, and
 every result is checked from the status lines:
 
-* encryption must report `END_ENCRYPTION` with AES-256, to both recipients;
+* encryption must report `BEGIN_ENCRYPTION` and `END_ENCRYPTION` with AES-256 (cipher 9), to the configured
+  recipients plus the recovery key (the config component: the recovery key only);
 * decryption must report `DECRYPTION_OKAY` with AES-256 and MDC or AEAD integrity. gpg emits plaintext before its
   check finishes, so output goes to a staging file that is used only after gpg exits successfully;
-* a signature counts only if `VALIDSIG` names a pinned signer's primary key and SHA-384. This is equivalent to
-  `--assert-signer`, which GnuPG releases before 2.4.5 lack.
+* a signature counts only if there is exactly one (`NEWSIG`), its `GOODSIG` and `VALIDSIG` name the same key, and
+  `VALIDSIG` names a pinned signer's primary key, ECDSA or RSA, and SHA-384. Expired or revoked signing keys fail.
+  This is stricter than `--assert-signer`, which GnuPG releases before 2.4.5 lack;
+* every pinned key, including each subkey, must meet the algorithm profile, or the key is rejected.
 
 Restores verify the manifest signature and each object's ciphertext SHA-384 *before* decrypting anything.
 
@@ -124,7 +138,7 @@ already ships Kyber, so a later move means new keys, not new code.
 
 | Level | What runs | Where | When |
 |---|---|---|---|
-| 1 Integrity | sizes and checksums against the backend, signature, `_COMPLETE` hash, lock status ("size only" where the backend reports no checksum) | the worker, no private key | after every backup; `nbbackup verify <set>`; the UI's Verify button |
+| 1 Integrity | sizes and checksums against the backend, signature, `_COMPLETE` hash, lock status ("size only" where the backend reports no usable checksum: Azure, SSE-KMS, SSE-C) | the worker, no private key | after every backup; `nbbackup verify <set>`; the UI's Verify button |
 | 2 QA restore | decrypt, hash check, full load into the slot, baseline check, migration plan | `nbbackup verify <set> --drill` in the restore slot | on demand (a separate QA instance follows in M2) |
 
 ## Restores
@@ -162,13 +176,15 @@ one-shot process from the same image and config. The restore commands skip Djang
 4. The operator switches NetBox: stop web and all workers, point `DATABASES['default']['NAME']` at the slot
    (`DB_NAME` in netbox-docker, or the Helm values), and start one ops container.
 5. `nbbackup restore finish` checks that it is connected to the restored database and that the old one has no
-   sessions. It moves the slot marker to the old database and takes a safety copy of the current media and scripts.
+   sessions. It moves the slot marker to the old database and takes a safety copy of the current media and scripts,
+   encrypted like a set (`media-before.tar.zst.enc`); decrypted archives are deleted as soon as they are written.
 6. `finish` continues:
    * runs `migrate --no-input`;
    * marks restored pending, scheduled and running jobs as errored;
    * empties NetBox's RQ keys, and the cache when it is NetBox's alone (otherwise only the `config` keys);
    * deletes all sessions and runs `reindex --lazy` and `ANALYZE`;
-   * writes the set's media and scripts, moving files the set doesn't have to `.nbb-quarantine/<restore_id>/`;
+   * writes the set's media and scripts through `STORAGES['default']` and `STORAGES['scripts']`, on every restore
+     path, moving files the set doesn't have to `.nbb-quarantine/<restore_id>/`;
    * reports resurrected users and tokens, syncs the catalog, writes the journal and enqueues a full backup.
 7. Start web and workers.
 
@@ -191,7 +207,8 @@ reads storage directly and never touches the catalog, so it also works on a fres
 | Locks | the relations involved exceed half the server's lock capacity | abort |
 | Redis | tasks and cache share one Redis database | warn; only RQ keys and the config cache keys are deleted |
 | Space | the local spool is too small, or server headroom is not confirmed (`--headroom-confirmed`) | abort; Azure Flexible Server turns read-only server-wide at 95 % used |
-| Instance | the set belongs to another `instance_id` | requires `--from-instance <id>` |
+| Instance | the set belongs to another `instance_id`, or this install's `instance_id` is not pinned | requires `--from-instance <id>` (`nbbackup list --all-instances`); QA restores and `restore-db` need a pinned ID |
+| Grantees | roles the dump grants to don't exist on this server | warn; loaded without privileges, the dropped GRANT/REVOKE/ALTER DEFAULT PRIVILEGES lines are kept in the journal (`dropped_grants`) |
 | Peppers | restored v2 tokens reference pepper IDs missing from `API_TOKEN_PEPPERS` | warn: those tokens stop validating |
 
 ### In-place restore
@@ -199,11 +216,16 @@ reads storage directly and never touches the catalog, so it also works on a fres
 This is the everyday path for application-level mistakes, such as a failed bulk edit, when no second database
 exists. The second database is then needed only in a disaster.
 
-* It requires NetBox to be stopped, no other sessions, and `--confirm <database name>`. An empty live database (a
-  fresh DR host) needs neither confirmation nor a safety set.
+* It requires NetBox to be stopped, no other sessions, and `--confirm <database name>`. An **empty** live database
+  (a fresh DR host) needs neither confirmation nor a safety set. Empty means all of: no relations in any non-system
+  schema, no extension but plpgsql, no slot marker, no unfinished restore journal for it, and the other database of
+  the configured slot pair empty too. Otherwise the error lists why and the newest change time in both databases.
+* A rerun after a crashed load (an unfinished journal for this database) reuses that journal's safety set and marks
+  the old journal `superseded`. It never takes a new safety set of half a load.
 * It takes a **safety set** of the live database and media, uploads it, and verifies the signature, hashes and level
-  1 *before anything is deleted*. A local copy stays on the spool as a fast path until finalize. If the live database
-  can't be dumped at all, `--skip-safety` proceeds without one and records that in the journal.
+  1 *before anything is deleted*. A local copy of the (encrypted) safety dump stays on the spool as a fast path until
+  finalize; the spool needs about 3× the set plus the safety set. If the live database can't be dumped at all,
+  `--skip-safety` proceeds without one and records that in the journal.
 * It empties the live database in one transaction with a lock timeout, loads the set, compares the baseline, then
   runs `finish`.
 * If any step fails, or later on request, `restore rollback --confirm <database>` reloads the safety set: from the
@@ -221,6 +243,20 @@ The trade-off is that NetBox is down for the whole load, and rollback is a secon
 * Restoring revives users, sessions and tokens that existed at backup time. `finish` deletes all sessions and
   reports every user and token that is active again although it was deleted or disabled before the restore, using a
   snapshot that load writes (encrypted) to the journal. With `--revoke-resurrected` it disables them as well.
+
+### The DR kit
+
+Keep these together, off the infrastructure they protect, and check them at every recovery-key drill:
+
+* read credentials for the storage targets (and the bucket, prefix and region or account URL);
+* the armored public keys and their fingerprints (ops, recovery, signing, trusted signers);
+* the recovery secret key and, separately, its passphrase;
+* the pinned `instance_id`;
+* the **direct** (not pooled) database DSN for `restore-db`, e.g. port 5432 rather than PgBouncer's 6432;
+* a NetBox image of the same version as the sets, with this plugin, gnupg and `postgresql-client` installed.
+
+Drills record which key decrypted each component; a drill in which the recovery key decrypted everything counts as
+a recovery-key drill and is tracked separately (`recovery_drill_at`).
 
 ### When NetBox itself cannot start
 
@@ -249,7 +285,10 @@ due:
 * deletion is by version where the target is versioned;
 * objects under an active lock are skipped and retried at the next prune;
 * the primary target does not prune a set until all its required replicas hold it;
-* incomplete sets (no `_COMPLETE`) older than a day are garbage once their lock expires;
+* incomplete sets (no `_COMPLETE`) older than max(24 h, the longest `max_runtime` + 1 h) are garbage once their
+  lock expires;
+* while a policy's newest `keep_last` sets are all unverified (e.g. after a bucket switched to SSE-KMS and level 1
+  failed), none of its sets is deleted and prune reports the policy as held;
 * probe objects (`target probe` writes them below `<instance_id>/.probe/`) older than a day go once their lock
   expires;
 * `--dry-run` shows the diff first, which matters after a retention change, since it applies to all sets.

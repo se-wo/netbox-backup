@@ -23,6 +23,12 @@ logger = logging.getLogger('netbox_backup')
 
 # An incomplete set (no _COMPLETE) older than this is garbage once its lock has expired
 INCOMPLETE_GRACE = timedelta(hours=24)
+# On targets without locks an incomplete set may still be being written: wait for the longest job to be over
+RUNTIME_MARGIN = timedelta(hours=1)
+
+
+def incomplete_grace(config):
+    return max([INCOMPLETE_GRACE, *[p.max_runtime + RUNTIME_MARGIN for p in config.policies.values()]])
 
 
 @dataclass
@@ -36,6 +42,7 @@ class TargetReport:
     waiting_for_replicas: list = field(default_factory=list)
     errors: list = field(default_factory=list)
     aborted_uploads: int = 0
+    held: dict = field(default_factory=dict)
     probes_due: list = field(default_factory=list)
     probes_deleted: int = 0
 
@@ -63,6 +70,8 @@ def prune_target(config, target, dry_run=False, log=None, now=None):
     log = log or logger
     now = now or timezone.now()
     report = TargetReport(target=target.name, can_delete=can_prune(target) and not dry_run)
+    if config.instance_id is None:
+        return report  # unpinned and no backup taken yet: nothing of ours in storage
     backend = get_backend(target)
     listings = sets.list_sets(backend, config.instance_id)
     rows = {s.set_id: s for s in BackupSet.objects.filter(set_id__in=[x.set_id for x in listings])}
@@ -73,7 +82,7 @@ def prune_target(config, target, dry_run=False, log=None, now=None):
     for listing in listings:
         row = rows.get(listing.set_id)
         if not listing.complete:
-            if now - listing.created > INCOMPLETE_GRACE:
+            if now - listing.created > incomplete_grace(config):
                 garbage.append(listing)
             continue
         policy = row.policy_name if row else ''
@@ -91,6 +100,12 @@ def prune_target(config, target, dry_run=False, log=None, now=None):
     to_delete = []
     for policy, items in by_policy.items():
         rules, tz = _retention_for(config, target, policy)
+        newest = sorted((c for _, c in items), key=lambda c: c.created, reverse=True)[:max(rules.keep_last, 1)]
+        if not any(c.verified for c in newest):
+            # GFS counts only verified sets: with the newest all unverified (e.g. checksums failing after a
+            # bucket switched to SSE-KMS), retention would let older history go. Hold until a set verifies.
+            report.held[policy or '(unknown)'] = f"the newest {len(newest)} set(s) are unverified"
+            continue
         keep, prune = retention.plan([c for _, c in items], rules, now, tz or settings.TIME_ZONE)
         report.keep.update(keep)
         listing_by_id = {listing.set_id: listing for listing, _ in items}
