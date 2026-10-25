@@ -238,6 +238,14 @@ class RestoreTest(EngineTestBase):
         self.assertIn('dcim.9999_from_the_future', ' '.join(check.errors))
         self.assertIn('some_plugin', ' '.join(check.warnings))
 
+    def test_legacy_migration_aliases_are_not_missing_plugins(self):
+        backup = create_backup(kind='database', trigger='cli')
+        manifest = self.read_manifest(backup)
+        manifest['migrations'] += ['default.0004_auto_20160423_0400', 'social_auth.0005_auto_20160727_2333']
+        check = restore.preflight(manifest)
+        self.assertTrue(check.ok, check.errors)
+        self.assertNotIn('not installed', ' '.join(check.warnings))
+
     def test_older_backup_schedules_migrations(self):
         backup = create_backup(kind='database', trigger='cli')
         manifest = self.read_manifest(backup)
@@ -304,3 +312,51 @@ class HealthTest(EngineTestBase):
         self.configure(storage={'backend': 'local', 'path': '/proc/forbidden'})
         conds = {c.name: c for c in health.conditions()}
         self.assertEqual(conds['StorageReachable'].status, health.ERROR)
+
+
+class NewerClientRestoreTest(EngineTestBase):
+    """
+    pg_restore 17+ emits SET transaction_timeout, which PostgreSQL < 17 rejects. Restores then go through psql
+    with that statement stripped. Exercise that path against whatever server the suite runs on.
+    """
+
+    def test_strip_decision(self):
+        from netbox_backup.engine import pg
+        self.assertEqual(pg.settings_to_strip(server_major=14, client_major=17), {'transaction_timeout'})
+        self.assertEqual(pg.settings_to_strip(server_major=17, client_major=17), set())
+        self.assertEqual(pg.settings_to_strip(server_major=14, client_major=16), set())
+
+    def test_filter(self):
+        from netbox_backup.engine import pg
+        unsupported = pg.unsupported_setting_filter({'transaction_timeout'})
+        self.assertTrue(unsupported(b'SET transaction_timeout = 0;\n'))
+        self.assertFalse(unsupported(b'SET statement_timeout = 0;\n'))
+        self.assertFalse(unsupported(b"INSERT INTO t VALUES ('SET transaction_timeout = 0');\n"))
+
+    def test_restore_and_test_restore_via_psql(self):
+        from netbox_backup.engine import pg
+        real_strip = pg.settings_to_strip
+
+        # lock_timeout is something every pg_restore emits, so also stripping it proves the filter runs on real
+        # output. Keep whatever the real client/server combination needs stripped as well.
+        def strip(server_major, client_major):
+            return real_strip(server_major, client_major) | {'lock_timeout'}
+
+        with mock.patch.object(pg, 'settings_to_strip', side_effect=strip), \
+                mock.patch.object(pg, 'restore_via_psql', wraps=pg.restore_via_psql) as via_psql:
+            backup = create_backup(kind='database', trigger='cli')
+            passed, results = verify_backup(backup, level='restore')
+            self.assertTrue(passed, results)
+            Site.objects.create(name='After', slug='after')
+            event = restore.restore_backup(catalog.resolve(backup.name), safety_backup=False)
+        self.assertEqual(via_psql.call_count, 2)
+        self.assertEqual(event.status, RestoreStatusChoices.STATUS_COMPLETED, event.log)
+        self.assertFalse(Site.objects.filter(slug='after').exists())
+
+    def test_psql_errors_are_reported(self):
+        from netbox_backup.engine import pg
+        backup = create_backup(kind='database', trigger='cli')
+        path = os.path.join(self.storage_path, backup.instance_id, backup.name, 'database.dump')
+        # Restoring over existing tables fails on the first CREATE TABLE; ON_ERROR_STOP must surface it
+        with self.assertRaisesRegex(pg.PostgresError, 'psql exited'):
+            pg.restore_via_psql(path, strip={'transaction_timeout'})

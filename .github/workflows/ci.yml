@@ -4,24 +4,40 @@ on:
   push:
   pull_request:
 
+env:
+  # pg_dump refuses to dump a newer server, so the client tracks the newest PostgreSQL in the matrix
+  PG_CLIENT: '18'
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: pip install ruff
-      - run: ruff check netbox_backup
+      - run: ruff check netbox_backup .github/scripts
 
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        netbox: ['v4.4.9', 'v4.7.3']
-        postgres: ['14', '17']
+        include:
+          # Each NetBox release against its minimum supported PostgreSQL, a previous major and the current one
+          - netbox: 'v4.4.9'
+            postgres: '14'
+          - netbox: 'v4.4.9'
+            postgres: '17'
+          - netbox: 'v4.4.9'
+            postgres: '18'
+          - netbox: 'v4.7.3'
+            postgres: '15'
+          - netbox: 'v4.7.3'
+            postgres: '17'
+          - netbox: 'v4.7.3'
+            postgres: '18'
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -35,15 +51,15 @@ jobs:
         image: redis:7
         ports: ['6379:6379']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: netbox-backup
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: netbox-community/netbox
           ref: ${{ matrix.netbox }}
           path: netbox
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install PostgreSQL client
@@ -51,8 +67,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y postgresql-client-17
-          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y "postgresql-client-$PG_CLIENT"
+          echo "/usr/lib/postgresql/$PG_CLIENT/bin" >> "$GITHUB_PATH"
       - name: Install
         run: |
           pip install -r netbox/requirements.txt
@@ -63,5 +79,76 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/netbox-backup/testing
           NETBOX_CONFIGURATION: netbox_backup_testing
         run: |
+          set -o pipefail
           python manage.py makemigrations netbox_backup --check --dry-run
-          python manage.py test netbox_backup --noinput -v 2
+          python manage.py test netbox_backup --noinput -v 2 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - name: Annotate test failures
+        if: failure()
+        run: python netbox-backup/.github/scripts/annotate_failures.py "$RUNNER_TEMP/test.log"
+
+  upgrade-restore:
+    # Back up on the oldest supported NetBox and restore into an empty database on the newest
+    name: restore ${{ matrix.from }} backup on ${{ matrix.to }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - from: 'v4.4.9'
+            to: 'v4.7.3'
+            postgres: '17'
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: netbox
+          POSTGRES_PASSWORD: netbox
+          POSTGRES_DB: netbox
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+    env:
+      PGHOST: localhost
+      PGUSER: netbox
+      PGPASSWORD: netbox
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: netbox-backup
+      - uses: actions/checkout@v7
+        with:
+          repository: netbox-community/netbox
+          ref: ${{ matrix.from }}
+          path: netbox-old
+      - uses: actions/checkout@v7
+        with:
+          repository: netbox-community/netbox
+          ref: ${{ matrix.to }}
+          path: netbox-new
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y "postgresql-client-$PG_CLIENT"
+          echo "/usr/lib/postgresql/$PG_CLIENT/bin" >> "$GITHUB_PATH"
+      - name: Install both NetBox releases
+        run: |
+          for side in old new; do
+            python -m venv "venv-$side"
+            "venv-$side/bin/pip" install -r "netbox-$side/requirements.txt"
+            "venv-$side/bin/pip" install -e "netbox-backup[all]"
+          done
+      - name: Back up on ${{ matrix.from }}, restore on ${{ matrix.to }}
+        env:
+          OLD_NETBOX: ${{ github.workspace }}/netbox-old
+          NEW_NETBOX: ${{ github.workspace }}/netbox-new
+          OLD_PYTHON: ${{ github.workspace }}/venv-old/bin/python
+          NEW_PYTHON: ${{ github.workspace }}/venv-new/bin/python
+          PLUGIN_DIR: ${{ github.workspace }}/netbox-backup
+        run: netbox-backup/.github/scripts/cross_version_restore.sh

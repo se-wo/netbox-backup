@@ -48,6 +48,8 @@ class NetBoxBackupConfig(PluginConfig):
         # PostgreSQL client binaries. Must be the same major version as (or newer than) the server.
         'pg_dump': 'pg_dump',
         'pg_restore': 'pg_restore',
+        # Used only when pg_restore is newer than the server (see docs/troubleshooting.md).
+        'psql': 'psql',
         'pg_dump_extra_args': [],
         # gzip level for file archives (0-9).
         'compression_level': 6,
