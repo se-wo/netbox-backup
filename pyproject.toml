@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netbox-backup"
+version = "0.1.0"
+description = "Open-source backup, verification and disaster recovery for NetBox"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [{ name = "netbox-backup contributors" }]
+keywords = ["netbox", "netbox-plugin", "backup", "disaster-recovery", "postgresql"]
+classifiers = [
+    "Framework :: Django",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Backup",
+]
+dependencies = []
+
+[project.optional-dependencies]
+s3 = ["boto3>=1.28"]
+encryption = ["cryptography>=41"]
+all = ["boto3>=1.28", "cryptography>=41"]
+
+[project.urls]
+Homepage = "https://github.com/se-wo/netbox-backup"
+Documentation = "https://github.com/se-wo/netbox-backup/tree/main/docs"
+
+[tool.setuptools.packages.find]
+include = ["netbox_backup*"]
+
+[tool.setuptools.package-data]
+netbox_backup = ["templates/**/*.html"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "RET"]
+ignore = ["RET504"]
+
+[tool.ruff.lint.isort]
+known-third-party = ["netbox", "core", "dcim", "extras", "users", "utilities"]
+known-first-party = ["netbox_backup"]

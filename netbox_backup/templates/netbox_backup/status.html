@@ -1,0 +1,78 @@
+{% extends 'generic/_base.html' %}
+{% load helpers %}
+{% load render_table from django_tables2 %}
+{% load i18n %}
+
+{% block title %}{% trans "Backup & Recovery" %}{% endblock %}
+
+{% block controls %}
+  <div class="btn-list">
+    <a href="{% url 'plugins:netbox_backup:backup_list' %}" class="btn btn-outline-secondary"><i class="mdi mdi-format-list-bulleted"></i> {% trans "Backups" %}</a>
+    <a href="{% url 'plugins:netbox_backup:restoreevent_list' %}" class="btn btn-outline-secondary"><i class="mdi mdi-history"></i> {% trans "Restores" %}</a>
+    {% if can_run %}
+      <a href="{% url 'plugins:netbox_backup:backup_run' %}" class="btn btn-primary"><i class="mdi mdi-play"></i> {% trans "Run backup" %}</a>
+    {% endif %}
+  </div>
+{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <div class="col col-12 col-lg-7">
+      <div class="card">
+        <h2 class="card-header">
+          {% trans "Conditions" %}
+          <div class="card-actions"><span class="badge text-bg-{{ overall_color }}">{{ overall|upper }}</span></div>
+        </h2>
+        <table class="table table-hover">
+          {% for c in conditions %}
+            <tr>
+              <td class="text-nowrap"><span class="badge text-bg-{{ c.color }}">{{ c.status|upper }}</span></td>
+              <td class="text-nowrap"><strong>{{ c.name }}</strong></td>
+              <td>{{ c.message }}</td>
+            </tr>
+          {% endfor %}
+        </table>
+      </div>
+    </div>
+    <div class="col col-12 col-lg-5">
+      <div class="card">
+        <h2 class="card-header">{% trans "Configuration" %}</h2>
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">{% trans "Instance ID" %}</th><td><code>{{ instance_id }}</code></td></tr>
+          {% for key, value in storage.items %}
+            <tr><th scope="row">{% trans "Storage" %} {{ key }}</th><td><code>{{ value }}</code></td></tr>
+          {% endfor %}
+          {% for label, minutes in schedules.items %}
+            <tr><th scope="row">{{ label }}</th><td>{% if minutes %}{% blocktrans %}every {{ minutes }} min{% endblocktrans %}{% else %}<span class="text-muted">{% trans "disabled" %}</span>{% endif %}</td></tr>
+          {% endfor %}
+          <tr><th scope="row">{% trans "Retention" %}</th><td>{{ retention|placeholder }} <span class="text-muted">({% blocktrans %}always keep newest {{ keep_last }}{% endblocktrans %})</span></td></tr>
+          <tr><th scope="row">{% trans "Encryption" %}</th><td>{% checkmark encrypted %}</td></tr>
+          <tr><th scope="row">{% trans "Configuration files" %}</th><td>{% checkmark include_configuration %}</td></tr>
+          <tr><th scope="row">{% trans "File trees" %}</th><td>{{ include_files|join:", "|placeholder }}</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Recent restores" %}</h2>
+        <ul class="list-group list-group-flush">
+          {% for event in recent_restores %}
+            <li class="list-group-item">
+              <a href="{{ event.get_absolute_url }}">{{ event.backup_name }}</a>
+              {% badge event.get_status_display bg_color=event.get_status_color %}
+              <span class="text-muted">{{ event.started_at|isodatetime }}</span>
+            </li>
+          {% empty %}
+            <li class="list-group-item text-muted">{% trans "No restores recorded" %}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="row">
+    <div class="col">
+      <div class="card">
+        <h2 class="card-header">{% trans "Recent backups" %}</h2>
+        <div class="table-responsive">{% render_table recent_backups 'inc/table.html' %}</div>
+      </div>
+    </div>
+  </div>
+{% endblock %}

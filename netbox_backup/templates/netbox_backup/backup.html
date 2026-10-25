@@ -1,0 +1,145 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+{% load humanize %}
+{% load i18n %}
+
+{% block extra_controls %}
+  {% if can_run %}
+    <form action="{% url 'plugins:netbox_backup:backup_verify' pk=object.pk %}" method="post" class="d-inline-flex gap-1">
+      {% csrf_token %}
+      <select name="level" class="form-select form-select-sm w-auto" aria-label="{% trans 'Verification level' %}">
+        {% for value, label in verify_form.fields.level.choices %}
+          <option value="{{ value }}"{% if value == 'deep' %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="btn btn-cyan"><i class="mdi mdi-check-decagram"></i> {% trans "Verify" %}</button>
+    </form>
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+  {% if object.error %}
+    <div class="alert alert-danger"><i class="mdi mdi-alert-octagon"></i> {{ object.error }}</div>
+  {% endif %}
+  {% for warning in object.warnings %}
+    <div class="alert alert-warning"><i class="mdi mdi-alert"></i> {{ warning }}</div>
+  {% endfor %}
+  <div class="row">
+    <div class="col col-12 col-md-6">
+      <div class="card">
+        <h2 class="card-header">{% trans "Backup" %}</h2>
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">{% trans "Name" %}</th><td><code>{{ object.name }}</code></td></tr>
+          <tr><th scope="row">{% trans "Kind" %}</th><td>{% badge object.get_kind_display bg_color=object.get_kind_color %}</td></tr>
+          <tr><th scope="row">{% trans "Status" %}</th><td>{% badge object.get_status_display bg_color=object.get_status_color %}</td></tr>
+          <tr><th scope="row">{% trans "Trigger" %}</th><td>{{ object.get_trigger_display|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Requested by" %}</th><td>{{ object.requested_by|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Instance" %}</th><td><code>{{ object.instance_id }}</code></td></tr>
+          <tr><th scope="row">{% trans "Host" %}</th><td>{{ object.manifest.hostname|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Started" %}</th><td>{{ object.started_at|isodatetime|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Completed" %}</th><td>{{ object.completed_at|isodatetime|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Duration" %}</th><td>{% if object.duration %}{{ object.duration.total_seconds|floatformat:1 }}s{% else %}{{ ''|placeholder }}{% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Size" %}</th><td>{% if object.size is not None %}{{ object.size|filesizeformat }}{% else %}{{ ''|placeholder }}{% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Location" %}</th><td><code>{{ object.location|placeholder }}</code></td></tr>
+          <tr><th scope="row">{% trans "Job" %}</th><td>{% if object.job %}{{ object.job|linkify }}{% else %}{{ ''|placeholder }}{% endif %}</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Source" %}</h2>
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">{% trans "NetBox version" %}</th><td>{{ object.netbox_version|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Plugin version" %}</th><td>{{ object.manifest.plugin_version|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "PostgreSQL" %}</th><td>{{ object.manifest.postgresql.server_version|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Database" %}</th><td>{{ object.manifest.database.name|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Tables / rows" %}</th><td>{{ object.manifest.database.tables|default:0|intcomma }} / {{ object.manifest.database.rows|default:0|intcomma }}</td></tr>
+          <tr><th scope="row">{% trans "Migrations" %}</th><td>{{ object.manifest.migrations|length }}</td></tr>
+          <tr>
+            <th scope="row">{% trans "Plugins" %}</th>
+            <td>
+              {% for name, version in object.manifest.netbox.plugins.items %}
+                <span class="badge text-bg-secondary">{{ name }} {{ version }}</span>
+              {% empty %}{{ ''|placeholder }}{% endfor %}
+            </td>
+          </tr>
+          <tr>
+            <th scope="row">{% trans "Encryption" %}</th>
+            <td>
+              {% if object.encrypted %}
+                <i class="mdi mdi-lock text-success"></i> {{ object.manifest.encryption.algorithm }}
+                <span class="text-muted">({% trans "key" %} {{ object.manifest.encryption.key_fingerprint }})</span>
+              {% else %}
+                <i class="mdi mdi-lock-open-variant text-warning"></i> {% trans "Not encrypted" %}
+              {% endif %}
+            </td>
+          </tr>
+        </table>
+      </div>
+      {% include 'inc/panels/tags.html' %}
+    </div>
+    <div class="col col-12 col-md-6">
+      <div class="card">
+        <h2 class="card-header">{% trans "Artifacts" %}</h2>
+        <table class="table table-hover">
+          <thead><tr><th>{% trans "File" %}</th><th>{% trans "Contents" %}</th><th class="text-end">{% trans "Size" %}</th><th>SHA-256</th><th></th></tr></thead>
+          {% for artifact in object.artifacts %}
+            <tr>
+              <td><code>{{ artifact.name }}</code></td>
+              <td>{{ artifact.type }}{% if artifact.files is not None %} <span class="text-muted">({{ artifact.files }} {% trans "files" %})</span>{% endif %}</td>
+              <td class="text-end">{{ artifact.size|filesizeformat }}</td>
+              <td><code title="{{ artifact.sha256 }}">{{ artifact.sha256|truncatechars:13 }}</code></td>
+              <td class="text-end">
+                {% if can_download %}
+                  <a href="{% url 'plugins:netbox_backup:backup_download' pk=object.pk artifact=artifact.name %}" class="btn btn-sm btn-outline-secondary" title="{% trans 'Download as stored' %}"><i class="mdi mdi-download"></i></a>
+                {% endif %}
+              </td>
+            </tr>
+          {% empty %}
+            <tr><td colspan="5" class="text-muted">{% trans "No artifacts" %}</td></tr>
+          {% endfor %}
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Verification" %}</h2>
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">{% trans "Status" %}</th><td>{% badge object.get_verification_status_display bg_color=object.get_verification_status_color %}</td></tr>
+          <tr><th scope="row">{% trans "Level" %}</th><td>{{ object.verification_level|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Verified" %}</th><td>{{ object.verified_at|isodatetime|placeholder }}</td></tr>
+        </table>
+        {% if object.verification_log %}
+          <ul class="list-group list-group-flush">
+            {% for result in object.verification_log %}
+              <li class="list-group-item">
+                {% if result.ok %}<i class="mdi mdi-check-circle text-success"></i>{% else %}<i class="mdi mdi-close-circle text-danger"></i>{% endif %}
+                {{ result.check }}{% if result.detail %} <span class="text-muted">&mdash; {{ result.detail }}</span>{% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Restore" %}</h2>
+        <div class="card-body">
+          <p>{% blocktrans %}Restores run from the command line on the NetBox host, with NetBox services stopped. A safety backup of the current state is taken first.{% endblocktrans %}</p>
+          <pre class="mb-0">{{ restore_command }} --dry-run
+{{ restore_command }}</pre>
+        </div>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Largest tables" %} <span class="text-muted small">({{ table_count }} {% trans "total" %})</span></h2>
+        <table class="table table-hover table-sm">
+          {% for table, rows in top_tables %}
+            <tr><td><code>{{ table }}</code></td><td class="text-end">{{ rows|intcomma }}</td></tr>
+          {% endfor %}
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="row">
+    <div class="col">
+      <div class="card">
+        <h2 class="card-header">{% trans "Manifest" %}</h2>
+        <div class="card-body"><pre class="mb-0" style="max-height: 30rem; overflow: auto">{{ object.manifest|json }}</pre></div>
+      </div>
+    </div>
+  </div>
+{% endblock %}
