@@ -1,14 +1,15 @@
 ###################################################################
 #  Test configuration for the netbox-backup plugin (derived from  #
-#  NetBox's configuration_testing.py)                             #
-#  only. It is not intended for production use.                   #
+#  NetBox's configuration_testing.py). Not for production use.    #
 ###################################################################
+
+import os
 
 ALLOWED_HOSTS = ['*']
 
 DATABASES = {
     'default': {
-        'NAME': 'netbox',
+        'NAME': os.environ.get('NETBOX_DB_NAME', 'netbox'),
         'USER': 'netbox',
         'PASSWORD': 'netbox',
         'HOST': 'localhost',
@@ -23,7 +24,10 @@ PLUGINS = [
 
 PLUGINS_CONFIG = {
     'netbox_backup': {
-        'storage': {'backend': 'local', 'path': '/tmp/netbox-backup-tests/storage'},
+        'storage': {
+            'backend': 'local',
+            'path': os.environ.get('NETBOX_BACKUP_STORAGE', '/tmp/netbox-backup-tests/storage'),
+        },
         'work_dir': '/tmp/netbox-backup-tests/work',
     },
 }

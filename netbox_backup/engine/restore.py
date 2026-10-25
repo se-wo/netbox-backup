@@ -38,6 +38,11 @@ logger = logging.getLogger('netbox_backup')
 
 FILE_COMPONENTS = ('media', 'scripts', 'reports')
 
+# Migration app labels that exist only as historical aliases, not as apps. social-auth-app-django < 6 (NetBox 4.4)
+# records its migrations under "default" and "social_auth" as well as "social_django"; 6.x dropped the aliases, so
+# a database from an older NetBox keeps rows for them. They are not missing plugins.
+LEGACY_MIGRATION_LABELS = {'default', 'social_auth'}
+
 
 class RestoreError(BackupError):
     pass
@@ -88,7 +93,7 @@ def migration_state(applied):
             replaced = {f'{a}.{n}' for a, n in migration.replaces}
             replaces[f'{app}.{name}'] = replaced
             known |= replaced
-    unknown = set(applied) - known
+    unknown = {m for m in set(applied) - known if m.split('.', 1)[0] not in LEGACY_MIGRATION_LABELS}
     pending = set()
     for app, name in loader.graph.nodes:
         key = f'{app}.{name}'

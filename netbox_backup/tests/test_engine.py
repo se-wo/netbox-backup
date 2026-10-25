@@ -238,6 +238,14 @@ class RestoreTest(EngineTestBase):
         self.assertIn('dcim.9999_from_the_future', ' '.join(check.errors))
         self.assertIn('some_plugin', ' '.join(check.warnings))
 
+    def test_legacy_migration_aliases_are_not_missing_plugins(self):
+        backup = create_backup(kind='database', trigger='cli')
+        manifest = self.read_manifest(backup)
+        manifest['migrations'] += ['default.0004_auto_20160423_0400', 'social_auth.0005_auto_20160727_2333']
+        check = restore.preflight(manifest)
+        self.assertTrue(check.ok, check.errors)
+        self.assertNotIn('not installed', ' '.join(check.warnings))
+
     def test_older_backup_schedules_migrations(self):
         backup = create_backup(kind='database', trigger='cli')
         manifest = self.read_manifest(backup)
