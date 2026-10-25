@@ -561,5 +561,18 @@ def _load_via_psql(db, path, strip, no_privileges, env, log):
 
 
 def analyze(conn):
+    """
+    ANALYZE the relations this role owns. A bare ANALYZE also visits the shared catalogs, which a non-superuser role
+    (any PaaS server) may not analyze, and the server logs a warning for each of them.
+    """
     with conn.cursor() as cursor:
-        cursor.execute('ANALYZE')
+        cursor.execute("""
+            SELECT n.nspname, c.relname
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'm', 'p') AND pg_has_role(c.relowner, 'USAGE')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%'
+        """)
+        relations = [sql.Identifier(schema, name) for schema, name in cursor.fetchall()]
+        if relations:
+            cursor.execute(sql.SQL('ANALYZE {}').format(sql.SQL(', ').join(relations)))

@@ -441,6 +441,8 @@ def _safety_size_estimate():
     """
     try:
         from ..models import BackupSet
+        if BackupSet._meta.db_table not in connection.introspection.table_names():
+            raise LookupError('no catalog in this database')  # an empty one: don't make the server log an error
         newest = BackupSet.objects.filter(status__in=SetStatusChoices.USABLE, size_bytes__isnull=False) \
             .order_by('-finished').values_list('size_bytes', flat=True).first()
         if newest:
