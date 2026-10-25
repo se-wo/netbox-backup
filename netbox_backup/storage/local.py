@@ -171,7 +171,7 @@ class LocalBackend(StorageBackend):
                     removed += 1
         return removed
 
-    def probe(self):
+    def probe(self, under=''):
         report = ProbeReport()
         try:
             os.makedirs(self._path(''), mode=0o700, exist_ok=True)
@@ -179,7 +179,7 @@ class LocalBackend(StorageBackend):
             report.check('target directory', False, f"{self._path('')}: {e.strerror}")
             return report
         report.check('target directory', os.access(self._path(''), os.W_OK), self._path(''))
-        key = f'.probe/{uuid.uuid4().hex}'
+        key = self.probe_key(under)
         try:
             self._probe_roundtrip(report, key)
         finally:

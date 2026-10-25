@@ -269,6 +269,9 @@ class Command(BaseCommand):
             for set_id in report.waiting_for_replicas:
                 self.stdout.write(f"  ~ {set_id} waits for its replicas")
             self.stdout.write(f"  kept {len(report.keep)} set(s)")
+            if report.probes_due:
+                done = f", {report.probes_deleted} deleted" if report.can_delete else ''
+                self.stdout.write(f"  {len(report.probes_due)} expired probe object(s){done}")
             for error in report.errors:
                 failed = True
                 self.stderr.write(self.style.ERROR(f"  ! {error}"))
@@ -366,7 +369,7 @@ class Command(BaseCommand):
         names = [options['name']] if options.get('name') else list(config.targets)
         failed = False
         for name in names:
-            report = get_backend(config.target(name)).probe()
+            report = get_backend(config.target(name)).probe(under=config.instance_id)
             StorageTarget.objects.filter(name=name).update(last_probe=report.as_dict(), last_probe_at=timezone.now())
             self.stdout.write(f"{name}: {'OK' if report.ok else 'FAILED'}")
             for c in report.checks:

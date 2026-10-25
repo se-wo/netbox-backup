@@ -213,6 +213,40 @@ class SlotRestoreTest(RestoreTestBase):
         with conf.database(dbname=SLOT).connect() as c:
             self.assertTrue(pg.is_empty(c))
 
+    def test_standalone_restore_db_into_slot_then_finish(self):
+        import json
+        from contextlib import redirect_stdout
+
+        from netbox_backup import cli
+        init_slot(SLOT)
+        backup_set = run_backup('default')
+        path = os.path.join(self.tmp, 'nbb.json')
+        with open(path, 'w') as f:
+            json.dump(conf.raw(), f)
+        db = conf.database()
+        os.environ['PGPASSWORD'] = db.password
+        try:
+            with redirect_stdout(io.StringIO()):
+                code = cli.main(['--config', path, 'restore-db', backup_set.set_id, '--dsn',
+                                 f"postgresql://{db.params['user']}@{db.params.get('host', 'localhost')}/{SLOT}"])
+        finally:
+            os.environ.pop('PGPASSWORD', None)
+        self.assertEqual(code, 0)
+        loaded = journal_mod.load(statuses=('loaded',))
+        self.assertEqual((loaded['strategy'], loaded['previous_database']), ('slot', self.original_name))
+        with conf.database().connect() as c:
+            self.assertTrue(pg.has_slot_marker(c, SLOT), 'finish moves the marker, not restore-db')
+
+        self.switch(SLOT)
+        finished = Restorer().finish(loaded.restore_id)
+        self.assertEqual(finished['status'], 'finished')
+        with conf.database().connect() as c:
+            self.assertFalse(pg.has_slot_marker(c, SLOT))
+            self.assertTrue(pg.has_slot_marker(c, self.original_name))
+        self.switch(self.original_name)
+        with conf.database().connect() as c:
+            pg.set_slot_marker(c, self.original_name, False)
+
     def test_drill(self):
         init_slot(SLOT)
         backup_set = run_backup('default')

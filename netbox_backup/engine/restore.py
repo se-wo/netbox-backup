@@ -20,6 +20,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+import psycopg
 from django.conf import settings
 from django.db import connection
 from django.utils import timezone
@@ -608,7 +609,11 @@ class Restorer:
                 if sessions:
                     raise RestoreError(f"{len(sessions)} session(s) still use {old}; stop all web and worker processes")
                 pgcore.set_slot_marker(conn, live, False)
-                pgcore.set_slot_marker(conn, old, True)
+                try:
+                    pgcore.set_slot_marker(conn, old, True)
+                except psycopg.Error:
+                    # A disaster may have taken the old database with it; there is then nothing to roll back to
+                    journal.warn(f"{old} could not be marked as the rollback copy (does it still exist?)")
         journal.update(status='finishing')
         journal.step('switch', detail=f"connected to {live}")
 

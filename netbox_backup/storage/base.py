@@ -10,15 +10,19 @@ leaves at most an incomplete upload that abort_incomplete() reclaims.
 """
 import hashlib
 import posixpath
+import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import BinaryIO, NamedTuple
 
 __all__ = (
     'Capabilities', 'DeleteError', 'ObjectExists', 'ObjectInfo', 'ObjectNotFound', 'ProbeReport', 'StorageBackend',
     'StorageError', 'Writer',
 )
+
+
+PROBE_DIR = '.probe'
 
 
 class StorageError(Exception):
@@ -175,8 +179,17 @@ class StorageBackend:
     def abort_incomplete(self, older_than: timedelta) -> int:
         raise NotImplementedError
 
-    def probe(self) -> ProbeReport:
+    def probe(self, under: str = '') -> ProbeReport:
+        """
+        under names the install's own area (its instance_id), so probe objects stay below it. On immutable
+        targets they stay locked like any object; prune collects them once the lock has expired.
+        """
         raise NotImplementedError
+
+    @staticmethod
+    def probe_key(under=''):
+        name = f'{datetime.now(UTC):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}'
+        return posixpath.join(*[p for p in (under.strip('/'), PROBE_DIR, name) if p])
 
     # Conveniences built on the interface
 

@@ -16,6 +16,7 @@ from ..choices import CopyStatusChoices, SetStatusChoices, VerifyLevelChoices
 from ..core import layout, sets
 from ..core.config import RetentionConfig
 from ..storage import StorageError, get_backend
+from ..storage.base import PROBE_DIR
 from . import retention
 
 logger = logging.getLogger('netbox_backup')
@@ -35,6 +36,8 @@ class TargetReport:
     waiting_for_replicas: list = field(default_factory=list)
     errors: list = field(default_factory=list)
     aborted_uploads: int = 0
+    probes_due: list = field(default_factory=list)
+    probes_deleted: int = 0
 
     def as_dict(self):
         return dict(self.__dict__)
@@ -108,6 +111,8 @@ def prune_target(config, target, dry_run=False, log=None, now=None):
             continue
         report.delete.append(listing.set_id)
 
+    report.probes_due = _expired_probes(backend, config.instance_id, now)
+
     if not report.can_delete:
         if not dry_run and report.delete:
             log.info(f"{target.name}: {len(report.delete)} set(s) due for pruning; no prune credential here, "
@@ -136,11 +141,33 @@ def prune_target(config, target, dry_run=False, log=None, now=None):
             row.status = SetStatusChoices.EXPIRED
             row.expired_at = now
             row.save(update_fields=('status', 'expired_at'))
+    for key in report.probes_due:
+        errors = pruner.delete([key])
+        report.errors += [f'{e.key}: {e.reason}' for e in errors]
+        report.probes_deleted += not errors
     try:
         report.aborted_uploads = pruner.abort_incomplete(timedelta(days=1))
     except StorageError as e:
         report.errors.append(f'abort incomplete uploads: {e}')
     return report
+
+
+def _expired_probes(backend, instance_id, now):
+    """
+    Probe objects ("target probe" writes them below <instance_id>/.probe/) older than a day whose lock has expired.
+    Listings don't always carry the lock date (S3), so each candidate is looked up.
+    """
+    due = []
+    for info in backend.list(f'{instance_id}/{PROBE_DIR}/'):
+        if info.last_modified and now - info.last_modified < INCOMPLETE_GRACE:
+            continue
+        retain_until = info.retain_until
+        if retain_until is None and backend.capabilities.default_retention:
+            stat = backend.stat(info.key)
+            retain_until = stat.retain_until if stat else None
+        if retain_until is None or retain_until <= now:
+            due.append(info.key)
+    return due
 
 
 def prune(dry_run=False, log=None, targets=None):

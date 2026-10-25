@@ -9,7 +9,6 @@ compliance mode; this driver never sets or extends locks.
 import base64
 import hashlib
 import threading
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
@@ -350,7 +349,7 @@ class S3Backend(StorageBackend):
                     removed += 1
         return removed
 
-    def probe(self):
+    def probe(self, under=''):
         report = ProbeReport()
         try:
             versioning = self.call(self.client.get_bucket_versioning, Bucket=self.bucket)
@@ -396,5 +395,5 @@ class S3Backend(StorageBackend):
             'lifecycle aborts incomplete uploads', report.abort_incomplete_days == 1,
             f"AbortIncompleteMultipartUpload after {report.abort_incomplete_days or 'never'} day(s); expected 1",
         )
-        self._probe_roundtrip(report, f'.probe/{datetime.now(UTC):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}')
+        self._probe_roundtrip(report, self.probe_key(under))
         return report

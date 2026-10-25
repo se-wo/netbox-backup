@@ -60,6 +60,7 @@ the storage is empty, the set fails: the volume is probably not mounted.
 <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/config.json.enc
 <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/_COMPLETE
 <prefix>/<instance_id>/journal/<restore_id>/<NNN>-<step>.json
+<prefix>/<instance_id>/.probe/<timestamp>-<id>
 ```
 
 `set_id` is a ULID, so keys sort by time on every backend. A set becomes visible only when `_COMPLETE` is written,
@@ -232,8 +233,10 @@ netbox-backup --config /etc/netbox-backup.json restore-db latest --dsn postgresq
 ```
 
 `restore-db` empties the target database (a marked slot, or `--confirm <database>`), decrypts with gpg, runs
-`pg_restore --exit-on-error` and checks the baseline. Afterwards, start NetBox against that database and run
-`manage.py nbbackup restore finish` as usual.
+`pg_restore --exit-on-error` and checks the baseline. It leaves a journal in storage: start NetBox against that
+database and run `manage.py nbbackup restore finish` as usual. When the target is the marked slot of the configured
+`databases` pair, the marker stays until `finish` moves it to the old database, so rollback and finalize work as
+after a normal slot restore.
 
 ## Retention and pruning
 
@@ -247,6 +250,8 @@ due:
 * objects under an active lock are skipped and retried at the next prune;
 * the primary target does not prune a set until all its required replicas hold it;
 * incomplete sets (no `_COMPLETE`) older than a day are garbage once their lock expires;
+* probe objects (`target probe` writes them below `<instance_id>/.probe/`) older than a day go once their lock
+  expires;
 * `--dry-run` shows the diff first, which matters after a retention change, since it applies to all sets.
 
 ## Security

@@ -294,3 +294,52 @@ class RetentionTest(TestCase):
         self.assertEqual(set(keep), {'000'})
         self.assertIn('min_age', keep['000'])
         self.assertIn('newest verified', keep['000'])
+
+
+class ProbeCollectionTest(PluginConfigMixin, TestCase):
+    """
+    Probe objects stay below the instance and are collected once their lock has expired.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import boto3
+        from moto import mock_aws
+        self.mock = mock_aws()
+        self.mock.start()
+        self.addCleanup(self.mock.stop)
+        os.environ.update({'NBB_TEST_S3_KEY': 'testing', 'NBB_TEST_S3_SECRET': 'testing'})
+        self.s3 = boto3.client('s3', region_name='us-east-1')
+
+    def use_bucket(self, bucket, locked):
+        if locked:
+            self.s3.create_bucket(Bucket=bucket, ObjectLockEnabledForBucket=True)
+            self.s3.put_object_lock_configuration(Bucket=bucket, ObjectLockConfiguration={
+                'ObjectLockEnabled': 'Enabled', 'Rule': {'DefaultRetention': {'Mode': 'COMPLIANCE', 'Days': 35}},
+            })
+        else:
+            self.s3.create_bucket(Bucket=bucket)
+        creds = {'access_key': 'env:NBB_TEST_S3_KEY', 'secret_key': 'env:NBB_TEST_S3_SECRET'}
+        self.configure(targets={'s3': {'backend': 's3', 'bucket': bucket, 'region': 'us-east-1',
+                                       'credentials': creds, 'prune_credentials': creds}})
+        target = conf.get_config().targets['s3']
+        get_backend(target).probe(under=conf.instance_id())
+        return target
+
+    def probe_keys(self, target):
+        return [o.key for o in get_backend(target).list(f'{conf.instance_id()}/.probe/')]
+
+    def test_expired_probe_collected(self):
+        target = self.use_bucket('probes', locked=False)
+        self.assertEqual(len(self.probe_keys(target)), 1)
+        fresh = prune.prune_target(conf.get_config(), target)
+        self.assertEqual(fresh.probes_due, [])  # younger than a day
+        report = prune.prune_target(conf.get_config(), target, now=timezone.now() + timedelta(days=2))
+        self.assertEqual(report.probes_deleted, 1)
+        self.assertEqual(self.probe_keys(target), [])
+
+    def test_locked_probe_kept(self):
+        target = self.use_bucket('locked-probes', locked=True)
+        report = prune.prune_target(conf.get_config(), target, now=timezone.now() + timedelta(days=2))
+        self.assertEqual(report.probes_due, [])
+        self.assertEqual(len(self.probe_keys(target)), 1)

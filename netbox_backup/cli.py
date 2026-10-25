@@ -140,18 +140,20 @@ def cmd_decrypt(args, config):
     return 0
 
 
-def write_loaded_journal(config, backend, target_name, manifest, database):
+def write_loaded_journal(config, backend, target_name, manifest, database, previous=None):
     """
     A journal in the "loaded" state, so "manage.py nbbackup restore finish" picks the restore up once NetBox starts
-    against the database. It finishes like an in-place restore and writes the set's media and scripts.
+    against the database, and also writes the set's media and scripts. With previous (the other database of the
+    slot pair) it is a slot restore: finish moves the marker to previous, so rollback and finalize work as usual.
     """
     now = datetime.now(UTC).isoformat()
     restore_id = layout.new_ulid()
     components = ['database'] + [c for c in ('media', 'scripts') if layout.OBJECT_NAMES[c] in manifest.objects]
     journal = {
-        'restore_id': restore_id, 'set_id': manifest.set_id, 'strategy': 'in-place', 'target': target_name,
-        'instance_id': config.instance_id, 'source_instance_id': manifest.instance_id, 'status': 'loaded',
-        'components': components, 'live_database': database, 'slot_database': database, 'previous_database': None,
+        'restore_id': restore_id, 'set_id': manifest.set_id, 'strategy': 'slot' if previous else 'in-place',
+        'target': target_name, 'instance_id': config.instance_id, 'source_instance_id': manifest.instance_id,
+        'status': 'loaded', 'components': components, 'live_database': previous or database,
+        'slot_database': database, 'previous_database': previous,
         'user': os.environ.get('USER', 'netbox-backup'), 'started': now, 'updated': now, 'seq': 1, 'warnings': [],
         'plan': {}, 'steps': [{'step': 'restore-db', 'status': 'done', 'at': now,
                                'detail': 'loaded by the standalone CLI; baseline matches'}],
@@ -182,17 +184,20 @@ def cmd_restore_db(args, config):
                     missing = pgcore.missing_roles(cursor, body.get('database', {}).get('grantees', []))
             print(f"emptied {db.name}; loading set {manifest.set_id}")
             pgcore.load_dump(db, paths['database'], jobs=config.restore_jobs, no_privileges=bool(missing))
+    # A marked slot of the configured pair keeps its marker: finish moves it to the old database, which then holds
+    # the rollback copy. Outside a pair there is no old database to mark, so the marker goes now.
+    previous = next((d for d in config.databases if d != db.name), None) if db.name in config.databases else None
     with db.connect() as conn, conn.cursor() as cursor:
         diff = pgcore.compare_baseline(body['baseline'], pgcore.baseline(cursor))
-        if marked:
-            # The database now holds NetBox data; it is no longer an empty slot
+        if marked and not previous:
             pgcore.set_slot_marker(conn, db.name, False)
     if diff:
         print(f"BASELINE MISMATCH: {pgcore.format_differences(diff)}", file=sys.stderr)
         return 2
     if missing:
         print(f"Loaded without privileges; re-apply grants for: {', '.join(missing)}", file=sys.stderr)
-    restore_id = write_loaded_journal(config, backend, target_name, manifest, db.name)
+    restore_id = write_loaded_journal(config, backend, target_name, manifest, db.name,
+                                      previous=previous if marked else None)
     print(f"Set {manifest.set_id} loaded into {db.name}; baseline matches. Start NetBox against {db.name} and run "
           f"'manage.py nbbackup restore finish {restore_id}'.")
     return 0

@@ -7,7 +7,6 @@ version-level immutability policy (not available on hierarchical-namespace accou
 real blob. Azure reports no whole-blob checksum for block uploads, so level-1 checks are size only.
 """
 import base64
-import uuid
 from datetime import UTC, datetime, timedelta
 
 from ..core.config import resolve_secret
@@ -218,7 +217,7 @@ class AzureBlobBackend(StorageBackend):
     def abort_incomplete(self, older_than):
         return 0  # The service garbage-collects uncommitted blocks after seven days
 
-    def probe(self):
+    def probe(self, under=''):
         report = ProbeReport()
         try:
             props = self.call(self.container.get_container_properties)
@@ -228,7 +227,7 @@ class AzureBlobBackend(StorageBackend):
             return report
         versioned = bool(getattr(props, 'immutable_storage_with_versioning_enabled', False))
         report.versioned = versioned
-        key = f'.probe/{datetime.now(UTC):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}'
+        key = self.probe_key(under)
         self._probe_roundtrip(report, key)
         info = self.stat(key)
         if self.target.retention_days:
