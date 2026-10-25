@@ -1,13 +1,36 @@
 import shutil
 import tempfile
+import time
 
+import psycopg
 from django.conf import settings
 from django.test import override_settings
+
+from .test_core import KeyMaterial
+
+INSTANCE_ID = '0b1d3c5e-7f90-4a1b-8c2d-3e4f5a6b7c8d'
+
+
+def drop_database(admin, name, wait=30.0):
+    """
+    DROP DATABASE ... WITH (FORCE) for a test database. As the non-superuser CI role, FORCE can't terminate an
+    autovacuum worker that just started on a freshly loaded database, so retry until it has finished.
+    """
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            admin.execute(f'DROP DATABASE IF EXISTS {name} WITH (FORCE)')
+            return
+        except (psycopg.errors.InsufficientPrivilege, psycopg.errors.ObjectInUse):
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.5)
 
 
 class PluginConfigMixin:
     """
-    Give each test its own storage and work directories, with optional plugin config overrides.
+    Gives each test a local target in a private directory, generated keys and a default policy. Override
+    plugin_config or call configure(**overrides) to change PLUGINS_CONFIG['netbox_backup'].
     """
     plugin_config = {}
 
@@ -15,26 +38,36 @@ class PluginConfigMixin:
         super().setUp()
         self.tmp = tempfile.mkdtemp(prefix='netbox-backup-test-')
         self.storage_path = f'{self.tmp}/storage'
+        self._override = None
         self.configure()
+
+    def crypto_config(self, identities=('ops',)):
+        keys = KeyMaterial.get()
+        return {
+            'public_keys': f"file:{keys['bundle']}",
+            'recipients': [keys['ops']['fpr']],
+            'recovery_key': keys['recovery']['fpr'],
+            'signing_key': keys['signing']['fpr'],
+            'signing_secret_key': f"file:{keys['signing']['sec']}",
+            'identities': [f"file:{keys[i]['sec']}" for i in identities],
+        }
 
     def configure(self, **overrides):
         config = {
-            'storage': {'backend': 'local', 'path': self.storage_path},
-            'work_dir': f'{self.tmp}/work',
+            'instance_id': INSTANCE_ID,
+            'targets': {'primary': {'backend': 'local', 'path': self.storage_path, 'allow_prune': True}},
+            'crypto': self.crypto_config(),
+            'spool_dir': f'{self.tmp}/spool',
             **self.plugin_config,
             **overrides,
         }
-        if getattr(self, '_override', None) is None:
-            self._base_config = dict(settings.PLUGINS_CONFIG.get('netbox_backup', {}))
-            self._override = override_settings(PLUGINS_CONFIG={**settings.PLUGINS_CONFIG, 'netbox_backup': {}})
-            self._override.enable()
-        # Mutate in place: re-creating the override would unwind any override_settings enabled after it
-        plugin_config = settings.PLUGINS_CONFIG['netbox_backup']
-        plugin_config.clear()
-        plugin_config.update({**self._base_config, **config})
+        if self._override is not None:
+            self._override.disable()
+        self._override = override_settings(PLUGINS_CONFIG={**settings.PLUGINS_CONFIG, 'netbox_backup': config})
+        self._override.enable()
 
     def tearDown(self):
-        self._override.disable()
-        self._override = None
+        if self._override is not None:
+            self._override.disable()
         shutil.rmtree(self.tmp, ignore_errors=True)
         super().tearDown()

@@ -1,25 +1,65 @@
 #!/usr/bin/env bash
 #
-# Upgrade-by-restore: take a full backup on an older NetBox release and restore it into an empty database on a
+# Upgrade-by-restore: take a set on an older NetBox release and restore it into an empty, unmigrated database on a
 # newer one, then check the data, the media files and the migration state came across.
 #
 # Required environment:
 #   OLD_NETBOX / NEW_NETBOX    NetBox checkouts (repository roots)
 #   OLD_PYTHON / NEW_PYTHON    Python interpreters with each release's requirements and this plugin installed
 #   PLUGIN_DIR                 this repository
-# Optional: PGHOST, PGPORT, PGUSER, PGPASSWORD for createdb/dropdb (the test configuration uses netbox/netbox)
+# Optional: PGHOST, PGPORT, PGUSER, PGPASSWORD for createdb/dropdb
 set -euo pipefail
 
 : "${OLD_NETBOX:?}" "${NEW_NETBOX:?}" "${OLD_PYTHON:?}" "${NEW_PYTHON:?}" "${PLUGIN_DIR:?}"
 
-export NETBOX_CONFIGURATION=netbox_backup_testing
-export PYTHONPATH="$PLUGIN_DIR/testing"
-export PYTHONWARNINGS=ignore
-export NETBOX_BACKUP_STORAGE
-NETBOX_BACKUP_STORAGE="$(mktemp -d)"
-OLD_DB=nbbk_cross_old
-NEW_DB=nbbk_cross_new
+WORK="$(mktemp -d)"
+OLD_DB=nbb_cross_old
+NEW_DB=nbb_cross_new
 MEDIA_FILE=image-attachments/cross-version-check.txt
+export NBB_CROSS_WORK="$WORK"
+export NETBOX_CONFIGURATION=nbb_cross
+export PYTHONPATH="$WORK/conf:$PLUGIN_DIR/testing"
+export PYTHONWARNINGS=ignore
+
+# Same static configuration on both sides: one local target, one key for encryption, signing and decryption
+mkdir -p "$WORK/conf" "$WORK/keys" "$WORK/storage"
+cat > "$WORK/conf/nbb_cross.py" <<'PY'
+import glob
+import os
+
+from netbox_backup_testing import *  # noqa: F401,F403
+
+work = os.environ['NBB_CROSS_WORK']
+
+
+def key(role):
+    found = glob.glob(f'{work}/keys/{role}/*.pub.asc')
+    return os.path.basename(found[0]).split('.')[0] if found else None
+
+
+ops, signing = key('ops'), key('signing')
+crypto = {}
+if ops and signing:
+    with open(f'{work}/keys/pubkeys.asc', 'wb') as out:
+        for path in glob.glob(f'{work}/keys/*/*.pub.asc'):
+            out.write(open(path, 'rb').read())
+    crypto = {
+        'public_keys': f'file:{work}/keys/pubkeys.asc',
+        'recipients': [ops], 'recovery_key': ops, 'signing_key': signing,
+        'signing_secret_key': f'file:{work}/keys/signing/{signing}.sec.asc',
+        'signing_passphrase': 'env:NBB_CROSS_PASSPHRASE',
+        'identities': [f'file:{work}/keys/ops/{ops}.sec.asc'],
+        'identity_passphrase': 'env:NBB_CROSS_PASSPHRASE',
+    }
+PLUGINS_CONFIG = {
+    'netbox_backup': {
+        'instance_id': '5f1c2d3e-4b5a-4c6d-8e7f-90a1b2c3d4e5',
+        'targets': {'local': {'backend': 'local', 'path': f'{work}/storage'}},
+        'crypto': crypto,
+        'spool_dir': f'{work}/spool',
+    },
+}
+PY
 
 manage() {  # manage <old|new> <args...>
     local side=$1; shift
@@ -34,7 +74,6 @@ counts() {  # Prints a JSON object of object counts that must survive the upgrad
     manage "$1" shell --no-imports -c "
 import json
 from dcim.models import Device, DeviceType, Site
-from extras.models import Tag
 from users.models import User
 print('COUNTS=' + json.dumps({
     'sites': Site.objects.count(),
@@ -49,14 +88,20 @@ print('COUNTS=' + json.dumps({
 cleanup() {
     dropdb --if-exists "$OLD_DB" || true
     dropdb --if-exists "$NEW_DB" || true
-    rm -rf "$NETBOX_BACKUP_STORAGE"
+    rm -rf "$WORK"
 }
 trap cleanup EXIT
-cleanup
+dropdb --if-exists "$OLD_DB" || true
+dropdb --if-exists "$NEW_DB" || true
 createdb "$OLD_DB"
 createdb "$NEW_DB"
 
 echo "::group::Old release: migrate, seed and back up"
+export NBB_CROSS_PASSPHRASE=cross-version-passphrase
+for role in ops signing; do
+    manage old nbbackup keys generate --role "$role" --name "cross-version $role <ci@example.com>" \
+        --out "$WORK/keys/$role" --passphrase-env NBB_CROSS_PASSPHRASE
+done
 manage old migrate --no-input -v0
 manage old shell --no-imports -c "
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -79,14 +124,15 @@ mkdir -p "$old_media/$(dirname $MEDIA_FILE)"
 echo "media from the old release" > "$old_media/$MEDIA_FILE"
 expected=$(counts old)
 echo "Expected: $expected"
-manage old netbox_backup create --full --verify deep
+manage old nbbackup run default
 echo "::endgroup::"
 
 echo "::group::New release: restore into an empty database"
 new_media=$(manage new shell --no-imports -c "from django.conf import settings; print('MEDIA=' + settings.MEDIA_ROOT)" | sed -n 's/^MEDIA=//p')
 rm -f "$new_media/$MEDIA_FILE"
-manage new netbox_backup restore latest-full --dry-run
-manage new netbox_backup restore latest-full --yes
+manage new nbbackup list
+manage new nbbackup restore plan latest
+manage new nbbackup restore load latest --in-place
 echo "::endgroup::"
 
 echo "::group::New release: checks"
@@ -106,15 +152,14 @@ if ! manage new migrate --check -v0; then
     status=1
 fi
 restore_status=$(manage new shell --no-imports -c "
-from netbox_backup.models import RestoreEvent
-event = RestoreEvent.objects.get()
-print('RESTORE=' + event.status + ' ' + str(len(event.row_count_mismatches)))
+from netbox_backup.models import RestoreRun
+print('RESTORE=' + RestoreRun.objects.get().status)
 " | sed -n 's/^RESTORE=//p')
 echo "Restore record: $restore_status"
-case "$restore_status" in
-    "completed 0"|"warning 0") ;;
-    *) echo "::error title=Cross-version restore::unexpected restore record: $restore_status"; status=1 ;;
-esac
+if [[ "$restore_status" != "finished" ]]; then
+    echo "::error title=Cross-version restore::unexpected restore record: $restore_status"
+    status=1
+fi
 rm -f "$old_media/$MEDIA_FILE" "$new_media/$MEDIA_FILE"
 echo "::endgroup::"
 exit $status

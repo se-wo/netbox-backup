@@ -1,19 +1,22 @@
+"""
+Read-only UI. Targets and policies mirror static config; configuration changes and restores happen outside the
+UI. The only actions are a manual backup (run_backuppolicy) and a level-1 check (verify_backupset).
+"""
 from django.contrib import messages
-from django.http import FileResponse, Http404, HttpResponseForbidden
+from django.http import HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.translation import gettext as _
 from django.views.generic import View
-from netbox.object_actions import BulkDelete, BulkExport, DeleteObject
+from netbox.object_actions import BulkExport
 from netbox.views import generic
+from packaging.version import InvalidVersion, Version
 from utilities.views import ConditionalLoginRequiredMixin, register_model_view
 
 from . import conf, filtersets, forms, tables
-from .choices import BackupTriggerChoices, VerificationLevelChoices
-from .engine import catalog, health
-from .engine.backup import storage_key
-from .jobs import BackupJob, VerifyBackupJob
-from .models import Backup, RestoreEvent
-from .storage import get_storage
+from .choices import TriggerChoices
+from .engine import health, scheduler
+from .jobs import QUEUE, enqueue_backup, enqueue_verify
+from .models import BackupPolicy, BackupSet, RestoreRun, StorageTarget
 
 
 def _deny(request, message):
@@ -21,202 +24,215 @@ def _deny(request, message):
     return HttpResponseForbidden(message)
 
 
+def compatibility(backup_set):
+    """
+    (ok, reason): can this install restore the set? restore plan does the full check with the manifest body.
+    """
+    from django.conf import settings
+
+    from .engine.restore import BROKEN_DUMP_VERSIONS
+    if backup_set.netbox_version in BROKEN_DUMP_VERSIONS:
+        return False, _('Sets from NetBox {v} lose ltree triggers').format(v=backup_set.netbox_version)
+    try:
+        source, running = Version(backup_set.netbox_version), Version(settings.VERSION.split('-')[0])
+    except InvalidVersion:
+        return None, _('Unknown NetBox version')
+    if source > running:
+        return False, _('Taken on NetBox {s}, newer than {r}: upgrade NetBox first').format(s=source, r=running)
+    if source < running:
+        return True, _('Taken on NetBox {s}; finish applies the migrations to {r}').format(s=source, r=running)
+    return True, _('Same NetBox version')
+
+
 #
-# Backups
+# Storage targets
 #
 
-@register_model_view(Backup, 'list', path='', detail=False)
-class BackupListView(generic.ObjectListView):
-    queryset = Backup.objects.all()
-    filterset = filtersets.BackupFilterSet
-    filterset_form = forms.BackupFilterForm
-    table = tables.BackupTable
-    template_name = 'netbox_backup/backup_list.html'
-    actions = (BulkExport, BulkDelete)
+@register_model_view(StorageTarget, 'list', path='', detail=False)
+class StorageTargetListView(generic.ObjectListView):
+    queryset = StorageTarget.objects.all()
+    filterset = filtersets.StorageTargetFilterSet
+    filterset_form = forms.StorageTargetFilterForm
+    table = tables.StorageTargetTable
+    actions = (BulkExport,)
 
 
-@register_model_view(Backup)
-class BackupView(generic.ObjectView):
-    queryset = Backup.objects.all()
-    template_name = 'netbox_backup/backup.html'
-    actions = (DeleteObject,)
+@register_model_view(StorageTarget)
+class StorageTargetView(generic.ObjectView):
+    queryset = StorageTarget.objects.all()
+    template_name = 'netbox_backup/storagetarget.html'
+    actions = ()
 
     def get_extra_context(self, request, instance):
-        row_counts = sorted(instance.row_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return {'policies': instance.policies.all()}
+
+
+#
+# Policies
+#
+
+@register_model_view(BackupPolicy, 'list', path='', detail=False)
+class BackupPolicyListView(generic.ObjectListView):
+    queryset = BackupPolicy.objects.select_related('primary_target')
+    filterset = filtersets.BackupPolicyFilterSet
+    filterset_form = forms.BackupPolicyFilterForm
+    table = tables.BackupPolicyTable
+    actions = (BulkExport,)
+
+
+@register_model_view(BackupPolicy)
+class BackupPolicyView(generic.ObjectView):
+    queryset = BackupPolicy.objects.all()
+    template_name = 'netbox_backup/backuppolicy.html'
+    actions = ()
+
+    def get_extra_context(self, request, instance):
+        policy = conf.get_config().policies.get(instance.name)
+        try:
+            workers = scheduler.queue_workers()
+        except Exception:
+            workers = None
+        recent = tables.BackupSetTable(instance.sets.restrict(request.user, 'view')[:10], orderable=False)
         return {
-            'top_tables': row_counts[:15],
-            'table_count': len(row_counts),
-            'verify_form': forms.VerifyBackupForm(),
-            'can_run': request.user.has_perm('netbox_backup.run_backup'),
-            'can_download': request.user.has_perm('netbox_backup.download_backup'),
-            'restore_command': f'manage.py netbox_backup restore {instance.name}',
+            'next_runs': scheduler.next_runs(policy) if policy else [],
+            'worst_case_loss': scheduler.worst_case_loss(policy) if policy else None,
+            'scheduling_active': workers,
+            'queue': QUEUE,
+            'recent_sets': recent,
+            'can_run': request.user.has_perm('netbox_backup.run_backuppolicy'),
         }
 
 
-@register_model_view(Backup, 'delete')
-class BackupDeleteView(generic.ObjectDeleteView):
-    queryset = Backup.objects.all()
+@register_model_view(BackupPolicy, 'run')
+class BackupPolicyRunView(ConditionalLoginRequiredMixin, View):
 
-
-@register_model_view(Backup, 'bulk_delete', path='delete', detail=False)
-class BackupBulkDeleteView(generic.BulkDeleteView):
-    queryset = Backup.objects.all()
-    filterset = filtersets.BackupFilterSet
-    table = tables.BackupTable
-
-
-@register_model_view(Backup, 'run', path='run', detail=False)
-class BackupRunView(ConditionalLoginRequiredMixin, View):
-    """
-    Queue a backup as a background job.
-    """
-    def get(self, request):
-        if not request.user.has_perm('netbox_backup.run_backup'):
-            return _deny(request, _('You do not have permission to run backups.'))
-        return render(request, 'netbox_backup/backup_run.html', {
-            'form': forms.RunBackupForm(),
-            'storage': _storage_description(),
-            'encrypted': bool(conf.encryption_key()),
-            'include_configuration': conf.include_configuration(),
-        })
-
-    def post(self, request):
-        if not request.user.has_perm('netbox_backup.run_backup'):
-            return _deny(request, _('You do not have permission to run backups.'))
-        form = forms.RunBackupForm(request.POST)
-        if not form.is_valid():
-            return render(request, 'netbox_backup/backup_run.html', {'form': form})
-        job = BackupJob.enqueue(
-            user=request.user,
-            kind=form.cleaned_data['kind'],
-            trigger=BackupTriggerChoices.TRIGGER_MANUAL,
-            requested_by=request.user.username,
-            verify_level=form.cleaned_data['verify_level'] or None,
-        )
-        messages.success(request, _('Backup queued as job {id}.').format(id=job.pk))
-        return redirect('core:job', pk=job.pk)
-
-
-@register_model_view(Backup, 'verify')
-class BackupVerifyView(ConditionalLoginRequiredMixin, View):
     def post(self, request, pk):
-        if not request.user.has_perm('netbox_backup.run_backup'):
-            return _deny(request, _('You do not have permission to verify backups.'))
-        backup = get_object_or_404(Backup.objects.restrict(request.user, 'view'), pk=pk)
-        form = forms.VerifyBackupForm(request.POST)
-        level = form.cleaned_data['level'] if form.is_valid() else VerificationLevelChoices.LEVEL_DEEP
-        job = VerifyBackupJob.enqueue(user=request.user, backup_id=backup.pk, level=level)
-        messages.success(request, _('Verification of {name} queued as job {id}.').format(name=backup, id=job.pk))
+        if not request.user.has_perm('netbox_backup.run_backuppolicy'):
+            return _deny(request, _('You do not have permission to run backups.'))
+        policy = get_object_or_404(BackupPolicy.objects.restrict(request.user, 'view'), pk=pk)
+        job = enqueue_backup(policy, trigger=TriggerChoices.MANUAL, user=request.user,
+                             created_by=request.user.username)
+        messages.success(request, _('Backup of {policy} queued as job {id}.').format(policy=policy, id=job.pk))
         return redirect('core:job', pk=job.pk)
 
 
-@register_model_view(Backup, 'download', path='download/<str:artifact>')
-class BackupDownloadView(ConditionalLoginRequiredMixin, View):
+#
+# Sets
+#
+
+@register_model_view(BackupSet, 'list', path='', detail=False)
+class BackupSetListView(generic.ObjectListView):
+    queryset = BackupSet.objects.select_related('policy').prefetch_related('copies')
+    filterset = filtersets.BackupSetFilterSet
+    filterset_form = forms.BackupSetFilterForm
+    table = tables.BackupSetTable
+    actions = (BulkExport,)
+
+
+@register_model_view(BackupSet)
+class BackupSetView(generic.ObjectView):
+    queryset = BackupSet.objects.select_related('policy', 'job')
+    template_name = 'netbox_backup/backupset.html'
+    actions = ()
+
+    def get_extra_context(self, request, instance):
+        ok, reason = compatibility(instance)
+        tables_ = sorted((instance.baseline or {}).get('tables', {}).items(), key=lambda kv: (-kv[1], kv[0]))
+        return {
+            'copies': tables.BackupCopyTable(instance.copies.select_related('target'), orderable=False),
+            'compatible': ok,
+            'compatibility_reason': reason,
+            'top_tables': tables_[:15],
+            'table_count': len(tables_),
+            'schemas': (instance.baseline or {}).get('schemas', {}),
+            'can_verify': request.user.has_perm('netbox_backup.verify_backupset'),
+            'restore_command': f'manage.py nbbackup restore plan {instance.set_id}',
+        }
+
+
+@register_model_view(BackupSet, 'verify')
+class BackupSetVerifyView(ConditionalLoginRequiredMixin, View):
+
+    def post(self, request, pk):
+        if not request.user.has_perm('netbox_backup.verify_backupset'):
+            return _deny(request, _('You do not have permission to verify backup sets.'))
+        backup_set = get_object_or_404(BackupSet.objects.restrict(request.user, 'view'), pk=pk)
+        job = enqueue_verify(backup_set.set_id, user=request.user)
+        messages.success(request, _('Level-1 check of {set} queued as job {id}.').format(set=backup_set, id=job.pk))
+        return redirect('core:job', pk=job.pk)
+
+
+#
+# Restores
+#
+
+@register_model_view(RestoreRun, 'list', path='', detail=False)
+class RestoreRunListView(generic.ObjectListView):
+    queryset = RestoreRun.objects.all()
+    filterset = filtersets.RestoreRunFilterSet
+    filterset_form = forms.RestoreRunFilterForm
+    table = tables.RestoreRunTable
+    actions = (BulkExport,)
+
+
+@register_model_view(RestoreRun)
+class RestoreRunView(generic.ObjectView):
+    queryset = RestoreRun.objects.all()
+    template_name = 'netbox_backup/restorerun.html'
+    actions = ()
+
+    def get_extra_context(self, request, instance):
+        return {'backup_set': BackupSet.objects.filter(set_id=instance.set_id).first()}
+
+
+#
+# Status
+#
+
+class StatusView(ConditionalLoginRequiredMixin, View):
     """
-    Stream an artifact exactly as stored (encrypted artifacts stay encrypted; decrypt with the CLI).
-    """
-    def get(self, request, pk, artifact):
-        if not request.user.has_perm('netbox_backup.download_backup'):
-            return _deny(request, _('You do not have permission to download backups.'))
-        backup = get_object_or_404(Backup.objects.restrict(request.user, 'view'), pk=pk)
-        names = {a['name'] for a in backup.artifacts} | {'manifest.json'}
-        if artifact not in names:
-            raise Http404
-        stream = get_storage().open_read(storage_key(backup.instance_id, backup.name, artifact))
-        return FileResponse(stream, as_attachment=True, filename=f'{backup.name}-{artifact}')
-
-
-@register_model_view(Backup, 'sync', path='sync', detail=False)
-class BackupSyncView(ConditionalLoginRequiredMixin, View):
-    def post(self, request):
-        if not request.user.has_perm('netbox_backup.run_backup'):
-            return _deny(request, _('You do not have permission to sync the backup catalog.'))
-        try:
-            stats = catalog.sync()
-            messages.success(request, _(
-                'Catalog synchronised: {created} imported, {updated} updated, {missing} missing from storage.'
-            ).format(**stats))
-        except Exception as e:
-            messages.error(request, _('Catalog sync failed: {error}').format(error=e))
-        return redirect('plugins:netbox_backup:backup_list')
-
-
-class BackupStatusView(ConditionalLoginRequiredMixin, View):
-    """
-    Recoverability overview: health conditions, configuration and recent activity.
+    Last success and next run per policy, copy matrix (set x target), verify freshness, capacity per target.
     """
     def get(self, request):
-        if not request.user.has_perm('netbox_backup.view_backup'):
+        if not request.user.has_perm('netbox_backup.view_backupset'):
             return _deny(request, _('You do not have permission to view backups.'))
         conds = health.conditions()
-        recent = tables.BackupTable(Backup.objects.restrict(request.user, 'view')[:10], orderable=False)
-        shown = ('name', 'kind', 'status', 'trigger', 'started_at', 'duration', 'size', 'verification_status')
-        for column in recent.columns:
-            if column.name not in shown:
-                recent.columns.hide(column.name)
+        config = None
+        try:
+            config = conf.get_config()
+        except Exception:
+            pass
+        policies = []
+        for row in BackupPolicy.objects.restrict(request.user, 'view').select_related('primary_target'):
+            policy = config.policies.get(row.name) if config else None
+            newest = row.sets.filter(verify_level__gte=1).order_by('-finished').first()
+            policies.append({
+                'row': row, 'newest': newest,
+                'next_run': (scheduler.next_runs(policy, 1) or [None])[0] if policy else None,
+                'loss': scheduler.worst_case_loss(policy) if policy else None,
+            })
+        targets = list(StorageTarget.objects.restrict(request.user, 'view').filter(enabled=True))
+        recent = list(BackupSet.objects.restrict(request.user, 'view').prefetch_related('copies')[:10])
+        matrix = []
+        for backup_set in recent:
+            by_target = {c.target_id: c for c in backup_set.copies.all()}
+            matrix.append({'set': backup_set, 'copies': [by_target.get(t.pk) for t in targets]})
+        capacity = []
+        for target in targets:
+            used = sum(s for s in BackupSet.objects.filter(copies__target=target, status__in=('uploaded', 'verified',
+                       'partial')).values_list('size_bytes', flat=True) if s)
+            capacity.append({'target': target, 'used': used,
+                             'percent': round(100 * used / target.quota_bytes) if target.quota_bytes else None})
         return render(request, 'netbox_backup/status.html', {
             'conditions': conds,
             'overall': health.overall(conds),
             'overall_color': health.COLORS[health.overall(conds)],
-            'instance_id': conf.instance_id(),
-            'storage': _storage_description(),
-            'schedules': {
-                _('Database backups'): conf.interval('database'),
-                _('Full backups'): conf.interval('full'),
-                _('Housekeeping'): conf.get('housekeeping_interval'),
-            },
-            'retention': conf.get('retention'),
-            'keep_last': conf.get('keep_last'),
-            'encrypted': bool(conf.encryption_key()),
-            'include_configuration': conf.include_configuration(),
-            'include_files': conf.get('include_files'),
-            'recent_backups': recent,
-            'recent_restores': RestoreEvent.objects.restrict(request.user, 'view')[:5],
-            'can_run': request.user.has_perm('netbox_backup.run_backup'),
+            'instance_id': config.instance_id if config else '',
+            'policies': policies,
+            'targets': targets,
+            'matrix': matrix,
+            'capacity': capacity,
+            'restores': RestoreRun.objects.restrict(request.user, 'view')[:5],
+            'last_tick': scheduler.last_tick(),
+            'pitr': health.pitr_conditions(),
         })
-
-
-def _storage_description():
-    try:
-        return get_storage().describe()
-    except Exception as e:
-        return {'error': str(e)}
-
-
-#
-# Restore events
-#
-
-@register_model_view(RestoreEvent, 'list', path='', detail=False)
-class RestoreEventListView(generic.ObjectListView):
-    queryset = RestoreEvent.objects.all()
-    filterset = filtersets.RestoreEventFilterSet
-    filterset_form = forms.RestoreEventFilterForm
-    table = tables.RestoreEventTable
-    actions = (BulkExport, BulkDelete)
-
-
-@register_model_view(RestoreEvent)
-class RestoreEventView(generic.ObjectView):
-    queryset = RestoreEvent.objects.all()
-    template_name = 'netbox_backup/restoreevent.html'
-    actions = (DeleteObject,)
-
-    def get_extra_context(self, request, instance):
-        return {
-            'backup': Backup.objects.filter(name=instance.backup_name).first(),
-            'safety_backup': Backup.objects.filter(name=instance.safety_backup_name).first()
-            if instance.safety_backup_name else None,
-        }
-
-
-@register_model_view(RestoreEvent, 'delete')
-class RestoreEventDeleteView(generic.ObjectDeleteView):
-    queryset = RestoreEvent.objects.all()
-
-
-@register_model_view(RestoreEvent, 'bulk_delete', path='delete', detail=False)
-class RestoreEventBulkDeleteView(generic.BulkDeleteView):
-    queryset = RestoreEvent.objects.all()
-    filterset = filtersets.RestoreEventFilterSet
-    table = tables.RestoreEventTable

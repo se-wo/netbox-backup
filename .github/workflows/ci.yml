@@ -1,8 +1,16 @@
 name: CI
 
 on:
+  # Branch pushes are covered by pull_request; push runs only for main, so a PR commit runs CI once
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push to a PR cancels its superseded run; runs on main always finish
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # pg_dump refuses to dump a newer server, so the client tracks the newest PostgreSQL in the matrix
@@ -25,31 +33,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Each NetBox release against its minimum supported PostgreSQL, a previous major and the current one
-          - netbox: 'v4.4.9'
-            postgres: '14'
-          - netbox: 'v4.4.9'
-            postgres: '17'
-          - netbox: 'v4.4.9'
+          # Each supported NetBox release against PostgreSQL 15 (NetBox 4.7's minimum) and the newest major
+          - netbox: 'v4.6.10'
+            postgres: '15'
+          - netbox: 'v4.6.10'
             postgres: '18'
           - netbox: 'v4.7.3'
             postgres: '15'
-          - netbox: 'v4.7.3'
-            postgres: '17'
           - netbox: 'v4.7.3'
             postgres: '18'
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
         env:
-          POSTGRES_USER: netbox
-          POSTGRES_PASSWORD: netbox
-          POSTGRES_DB: netbox
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          PGUSER: postgres  # for the health check; pg_isready would otherwise log in as root
         ports: ['5432:5432']
         options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
       redis:
         image: redis:7
         ports: ['6379:6379']
+    env:
+      NETBOX_DB_USER: nbb_owner
+      NETBOX_DB_PASSWORD: nbb_owner
+      NBB_TEST_AZURITE: '1'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -62,13 +70,24 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Install PostgreSQL client
+      - name: Install PostgreSQL client and GnuPG
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-common
+          sudo apt-get install -y postgresql-common gnupg
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y "postgresql-client-$PG_CLIENT"
           echo "/usr/lib/postgresql/$PG_CLIENT/bin" >> "$GITHUB_PATH"
+          gpg --version | head -2
+      - name: Non-superuser database owner, as on a shared PaaS server
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -c "CREATE ROLE nbb_owner LOGIN PASSWORD 'nbb_owner' NOSUPERUSER CREATEDB"
+          psql -h localhost -U postgres -c "CREATE DATABASE netbox OWNER nbb_owner"
+      - name: Azurite
+        run: >-
+          docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite
+          azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
       - name: Install
         run: |
           pip install -r netbox/requirements.txt
@@ -88,22 +107,22 @@ jobs:
 
   upgrade-restore:
     # Back up on the oldest supported NetBox and restore into an empty database on the newest
-    name: restore ${{ matrix.from }} backup on ${{ matrix.to }}
+    name: restore ${{ matrix.from }} set on ${{ matrix.to }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - from: 'v4.4.9'
+          - from: 'v4.6.10'
             to: 'v4.7.3'
             postgres: '17'
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
         env:
-          POSTGRES_USER: netbox
-          POSTGRES_PASSWORD: netbox
-          POSTGRES_DB: netbox
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          PGUSER: postgres  # for the health check; pg_isready would otherwise log in as root
         ports: ['5432:5432']
         options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
       redis:
@@ -111,8 +130,10 @@ jobs:
         ports: ['6379:6379']
     env:
       PGHOST: localhost
-      PGUSER: netbox
-      PGPASSWORD: netbox
+      PGUSER: nbb_owner
+      PGPASSWORD: nbb_owner
+      NETBOX_DB_USER: nbb_owner
+      NETBOX_DB_PASSWORD: nbb_owner
     steps:
       - uses: actions/checkout@v7
         with:
@@ -130,13 +151,18 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Install PostgreSQL client
+      - name: Install PostgreSQL client and GnuPG
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-common
+          sudo apt-get install -y postgresql-common gnupg
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y "postgresql-client-$PG_CLIENT"
           echo "/usr/lib/postgresql/$PG_CLIENT/bin" >> "$GITHUB_PATH"
+      - name: Non-superuser database owner
+        env:
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: psql -c "CREATE ROLE nbb_owner LOGIN PASSWORD 'nbb_owner' NOSUPERUSER CREATEDB"
       - name: Install both NetBox releases
         run: |
           for side in old new; do

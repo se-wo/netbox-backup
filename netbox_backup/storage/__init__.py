@@ -1,29 +1,37 @@
-from django.core.exceptions import ImproperlyConfigured
-from django.utils.module_loading import import_string
+"""
+Storage drivers. Third-party packages add backends through the "netbox_backup.backends" entry point group, whose
+entries name a StorageBackend subclass.
+"""
+from importlib.metadata import entry_points
 
-from .base import Storage, StorageError
+from .base import Capabilities, ObjectExists, ObjectInfo, ObjectNotFound, ProbeReport, StorageBackend, StorageError
 
-__all__ = ('Storage', 'StorageError', 'get_storage')
+__all__ = (
+    'BUILTIN_BACKENDS', 'Capabilities', 'ObjectExists', 'ObjectInfo', 'ObjectNotFound', 'ProbeReport',
+    'StorageBackend', 'StorageError', 'backend_class', 'get_backend',
+)
 
-BACKENDS = {
-    'local': 'netbox_backup.storage.local.LocalStorage',
-    's3': 'netbox_backup.storage.s3.S3Storage',
+BUILTIN_BACKENDS = {
+    'local': 'netbox_backup.storage.local:LocalBackend',
+    's3': 'netbox_backup.storage.s3:S3Backend',
+    'azure_blob': 'netbox_backup.storage.azure_blob:AzureBlobBackend',
 }
 
 
-def get_storage(config=None):
+def backend_class(name):
+    import importlib
+    path = BUILTIN_BACKENDS.get(name)
+    if path is None:
+        matches = [ep for ep in entry_points(group='netbox_backup.backends') if ep.name == name]
+        if not matches:
+            raise StorageError(f"Unknown storage backend {name!r}")
+        return matches[0].load()
+    module, _, attr = path.partition(':')
+    return getattr(importlib.import_module(module), attr)
+
+
+def get_backend(target, prune=False):
     """
-    Instantiate the configured storage backend. "backend" may be a built-in name or a dotted path to a
-    Storage subclass.
+    Instantiate the driver for a TargetConfig. prune=True selects the target's prune credentials.
     """
-    from .. import conf
-    config = dict(config or conf.storage_config())
-    backend = config.pop('backend', 'local')
-    try:
-        cls = import_string(BACKENDS.get(backend, backend))
-    except ImportError as e:
-        raise ImproperlyConfigured(f"netbox_backup: unknown storage backend {backend!r}") from e
-    try:
-        return cls(**config)
-    except TypeError as e:
-        raise ImproperlyConfigured(f"netbox_backup: invalid options for storage backend {backend!r}: {e}") from e
+    return backend_class(target.backend)(target, prune=prune)

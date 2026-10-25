@@ -1,0 +1,49 @@
+# Example alert rules for netbox-backup. Thresholds assume a daily policy with max_runtime 4h; adjust "for" and the
+# 30h window (interval + max_runtime + 1 h, plus slack) to your schedules.
+groups:
+  - name: netbox-backup
+    rules:
+      - alert: NetBoxBackupStale
+        expr: time() - max by (policy) (netbox_backup_last_success_timestamp_seconds) > 30 * 3600
+        labels: {severity: critical}
+        annotations:
+          summary: "No verified NetBox backup for policy {{ $labels.policy }} in 30 hours"
+      - alert: NetBoxBackupMetricsAbsent
+        expr: absent(netbox_backup_scheduler_last_tick_timestamp_seconds)
+        for: 30m
+        labels: {severity: critical}
+        annotations:
+          summary: "No netbox-backup metrics at all (plugin not loaded, METRICS_ENABLED off, or scrape broken)"
+      - alert: NetBoxBackupSchedulerStopped
+        expr: time() - netbox_backup_scheduler_last_tick_timestamp_seconds > 15 * 60
+        labels: {severity: critical}
+        annotations:
+          summary: "netbox-backup scheduler has not run for 15 minutes (no RQ worker?)"
+      - alert: NetBoxBackupPoliciesDropped
+        expr: delta(netbox_backup_enabled_policies[1h]) < 0
+        labels: {severity: warning}
+        annotations:
+          summary: "The number of enabled backup policies dropped"
+      - alert: NetBoxBackupNoLockedOffsiteCopy
+        expr: max by (policy) (netbox_backup_locked_offsite_copies) == 0
+        for: 1h
+        labels: {severity: critical}
+        annotations:
+          summary: "No verified, locked off-site copy for policy {{ $labels.policy }}"
+      - alert: NetBoxBackupMediaMissing
+        expr: netbox_backup_media_missing > 0
+        for: 1d
+        labels: {severity: warning}
+        annotations:
+          summary: "Files referenced by NetBox are missing from media ({{ $value }})"
+      - alert: NetBoxBackupTargetDown
+        expr: netbox_backup_target_up == 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Last probe of backup target {{ $labels.target }} failed"
+      - alert: NetBoxBackupNoQARestore
+        expr: (time() - max by (policy) (netbox_backup_last_verified_timestamp_seconds{level="2"})) > 35 * 86400
+        labels: {severity: warning}
+        annotations:
+          summary: "No successful QA restore of policy {{ $labels.policy }} in 35 days"

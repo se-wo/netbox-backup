@@ -1,53 +1,33 @@
-# NetBox Enterprise Feature Parity
+# Enterprise parity
 
-This plugin was designed from the public NetBox Enterprise backup documentation:
+NetBox Enterprise has three backup layers: continuous pgBackRest backups in a cluster volume, Velero DR backups to
+S3, and a manual kubectl procedure. This table maps every documented behaviour to this plugin.
 
-* Backup Essentials: `netboxlabs.com/docs/enterprise/nbe-backup-essentials/`
-* Backup and Restore in Depth: `netboxlabs.com/docs/enterprise/nbe-backups/`
-* PostgreSQL Disaster Recovery: `netboxlabs.com/docs/enterprise/nbe-postgresql-dr/` (and its troubleshooting page)
-* Advanced Tools and Troubleshooting: `netboxlabs.com/docs/enterprise/nbe-troubleshooting/`
+| Enterprise behaviour (documented) | Enterprise mechanism | netbox-backup | Status |
+|---|---|---|---|
+| PostgreSQL backups on by default, full Sunday and incremental Monday–Saturday at 01:00, `retentionFull: 4` | Crunchy PGO + pgBackRest | A policy enabled at install: daily at 01:00, GFS retention | Done |
+| Continuous WAL archiving; PITR by time, LSN or immediate | pgBackRest `archive_command` | Monitors an external pgBackRest stanza; configuration rendering and runbooks later | Monitoring done |
+| DR backup of the whole install to S3, daily/weekly/cron, retention 1 month | Velero | Sets to any backend, cron schedule, GFS and minimum age | Done |
+| A unique prefix per cluster, else clusters can't be told apart | Operator discipline | Mandatory `instance_id` in every key and manifest; restore shows the source instance | Done |
+| Restore silently hides backups from other versions | Installer version filter | Every set is listed with a compatibility verdict and reason; older sets restore with migrations | Done |
+| "Application restored!" doesn't prove data; compare a recorded Sites count | Manual | The manifest stores per-table counts, per-schema index/constraint/trigger counts and the newest `last_updated`; restore compares them automatically | Done |
+| Live data dir excluded to avoid torn copies | Velero exclusion + pgBackRest rebuild | Never copies files from a data dir: `pg_dump` inside an exported snapshot | Done |
+| hostPath volumes skipped while the backup reports Completed | Velero limitation | Components report bytes and file counts; referenced-but-missing media warns; empty-but-referenced storage fails the set | Done |
+| Manual backup: media, scripts, reports, static; `pg_dumpall`; secrets; config with `--decrypt` | kubectl exec scripts | The same components, encrypted; the config component includes the secrets | Done |
+| Manual restore: maintenance mode, secrets first, drop/recreate the DB with template0 UTF8, fix grants | Runbook | Restore into a marked second database and switch by config, or in place behind a verified safety set | Done |
+| Repo pressure alert at 70 % of `repoStorageSize` | `PostgresBackupRepoPressure` | Capacity per target, alert at 70 % of `quota_bytes` | Done |
+| WAL piles up without limit when archiving fails, while Ready stays True | PostgreSQL behaviour | Alerts on `pg_stat_archiver.failed_count` and archive lag | Later |
+| Restore removes schedules, which return after recovery; the restore flag must be cleared | Operator behaviour | Backups of the live database continue during a slot load; finish resets job state and takes a full backup | Done |
+| PITR leaves a timeline fork until the next full backup | pgBackRest error [058] | A full backup is enqueued right after any restore | Done |
+| S3 stores rejecting `STREAMING-UNSIGNED-PAYLOAD-TRAILER` fail with InvalidArgument | Velero AWS plugin v1.14.2 | `checksum_mode: when_required` | Done |
+| HA restore waits for 3 controller nodes | Embedded Cluster | Not applicable: a restore needs one database and one process | n/a |
+| Air-gapped installs unsupported for DR | Embedded Cluster | Supported via local/NFS targets (SFTP in M2) | Done |
 
-No Enterprise code was used or inspected. The behaviours below were taken from the documentation. Where
-Enterprise relies on Kubernetes machinery (Velero, the Crunchy PostgreSQL operator, the KOTS admin console), the
-plugin provides the equivalent outcome with tools available on every NetBox install.
+## Roadmap
 
-## What Enterprise documents, and what this plugin does
-
-| Enterprise (as documented) | netbox-backup |
-|---|---|
-| **Disaster-recovery backup**: a Velero snapshot of the whole install (volumes, databases, configuration) | **Full backup**: consistent DB dump + media + scripts + reports + configuration files |
-| **PostgreSQL backup**: pgBackRest, on by default, weekly full + daily incremental, continuous WAL archiving | **Database backup**, on by default (daily), logical `pg_dump`. Optional pgBackRest **monitoring** (`PointInTimeRecovery` condition) and a [setup guide](postgresql-dr.md) for WAL/PITR on the DB server |
-| DR backup schedules are off by default | `full_backup_interval` is off by default |
-| Retention policy card: number + unit, default **1 month** | `retention: '1 month'` (same syntax: `'30 days'`, `'2 weeks'`, …), plus `keep_last` |
-| S3 storage settings entered in the admin console | `storage` backend `s3` (any S3-compatible target), or `local`/NFS |
-| "Backup now" from the admin console's Backups tab | **Run backup** in the UI, `POST /api/plugins/backup/backups/run/`, `netbox_backup create` |
-| Restore via the installer's `restore` command, confirming at a "Restore from backup instance?" prompt | `netbox_backup restore`, which requires typing the backup name (or `--yes`) |
-| **Restores always rebuild the database from the PostgreSQL backups**; the DR snapshot deliberately excludes the PG data volume | The database is restored only from the logical dump, never from a file-level copy of a running data directory |
-| **A healthy cluster after restore does not prove the data is back; check row counts** | Row counts for every table are recorded at backup time (same snapshot as the dump) and **compared automatically** after every restore and test restore |
-| `PostgresRecoveryRequired`, `PostgresRestoreFailed`, `PostgresRestorePending` conditions; a restored-but-unrecovered DB must not report Ready | `RestoreEvent` status `recovery-required` / `failed`, and a **RecoveryRequired** health condition in *error* |
-| *"Absence of RestoreFailed proves nothing"* | Health conditions report positive evidence (**RestoreTested**, **BackupVerified**), not only the absence of failures |
-| **A DR backup can report Completed and hold no volume data**; verify before relying on it | Pre-upload check that the dump has data for every non-empty table; `deep` and `restore` verification levels |
-| **Shared buckets: restoring another cluster's backup succeeds and brings up the other cluster's data**; give each cluster its own bucket or prefix | Backups are namespaced by `instance_id`. Restore **refuses** foreign backups by default. **StorageIsolated** warns when other instances share the location |
-| **Restore filters backups by installer version**; download the installer matching the backup | Preflight compares the backup's applied migrations with the running code: **refuses** backups from newer code, migrates backups from older code |
-| Pre-2.3.0 backups cannot restore the database; take a backup right after upgrading | Manifest format is versioned (`netbox-backup/1`). Documentation recommends `create --full --verify restore` before and after upgrades |
-| Reset before restoring on the same host; verify the backup first | Automatic **safety backup** before every restore (skipped on an empty DR host), and artifacts are downloaded and verified **before** anything is wiped |
-| Manual backups: `pg_dumpall` of the built-in PostgreSQL, plus media/scripts/reports and secrets | `netbox_backup download` gives standard `pg_restore`-able dumps and tarballs; manual restore documented |
-| Support bundles for diagnostics | `netbox_backup status --json` / `show --json` (no secrets), job logs, restore logs |
-| Encryption of backups at rest | Client-side AES-256-GCM with key fingerprint checks, and optional S3 SSE |
-
-## Differences by design
-
-* **No restore from the web UI.** Enterprise restores run from the installer on the host. Here they run from the
-  CLI, because a restore replaces the database the web UI is served from, and NetBox services should be
-  stopped first.
-* **Logical rather than physical database backups by default.** A plugin runs as the NetBox database user,
-  often on a different host from PostgreSQL. It cannot configure `archive_command` or read the data directory.
-  Logical dumps are portable across PostgreSQL major versions and verifiable from NetBox. PITR is a documented,
-  optional, monitored add-on.
-* **No Kubernetes dependencies.** It works the same on bare metal, Docker Compose and Helm deployments. In
-  Kubernetes, point `storage` at S3 and make sure the worker pod has the PostgreSQL client tools.
-
-## Not implemented
-
-* Block-level volume snapshots (Velero/CSI). Use your platform's snapshot tooling if you need them.
-* Backups of Redis (not needed: cache and queue only) and of Diode/Hydra or other Enterprise-only components.
+| Milestone | Scope | Status |
+|---|---|---|
+| M1 Core | Full sets; s3, azure_blob, local; GnuPG encryption and signing; signed manifest; GFS retention on bucket default retention; prune with a separate credential; restore in place or via marked slot and switch; level-1 integrity; metrics and alert rules; `status --json`; external check; standalone CLI | Implemented |
+| M2 Backends and drills | gcs, sftp, rclone; replicas (ReplicateJob); QA restore instance (scheduled QA restores, `finish --qa` reports signed with the QA key) | `verify --drill` and `finish --qa` exist; the rest is next |
+| M3 Browse | Load a set into the slot read-only, diff objects against live, export selected objects | Planned |
+| Later | Incremental media; provider-clone load (`--from-dsn`); pgBackRest configuration for self-hosted servers | On demand |

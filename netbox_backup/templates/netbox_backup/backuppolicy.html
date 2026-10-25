@@ -1,0 +1,57 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+{% load render_table from django_tables2 %}
+{% load i18n %}
+
+{% block extra_controls %}
+  {% if can_run %}
+    <form action="{% url 'plugins:netbox_backup:backuppolicy_run' pk=object.pk %}" method="post" class="d-inline">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-primary"><i class="mdi mdi-play"></i> {% trans "Run backup" %}</button>
+    </form>
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+  {% if scheduling_active == 0 %}
+    <div class="alert alert-danger"><i class="mdi mdi-alert-octagon"></i>
+      {% trans "Scheduling not active: no RQ worker serves" %} <code>{{ queue }}</code>. {% trans "Run" %} <code>manage.py rqworker {{ queue }}</code>.
+    </div>
+  {% endif %}
+  <div class="row">
+    <div class="col col-12 col-md-6">
+      <div class="card">
+        <h2 class="card-header">{% trans "Policy" %}</h2>
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">{% trans "Name" %}</th><td>{{ object.name }}</td></tr>
+          <tr><th scope="row">{% trans "Components" %}</th><td>{% for c in object.components %}<span class="badge text-bg-secondary">{{ c }}</span> {% endfor %}</td></tr>
+          <tr><th scope="row">{% trans "Schedule" %}</th><td><code>{{ object.schedule|placeholder }}</code> {{ object.time_zone }}</td></tr>
+          <tr><th scope="row">{% trans "Worst-case data loss" %}</th><td>{% if worst_case_loss %}{% blocktrans with loss=worst_case_loss %}up to {{ loss }} of changes{% endblocktrans %}{% else %}{{ ''|placeholder }}{% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Primary target" %}</th><td>{{ object.primary_target|linkify }}</td></tr>
+          <tr><th scope="row">{% trans "Replicas" %}</th><td>{% for t in object.replica_targets.all %}{{ t|linkify }} {% empty %}{{ ''|placeholder }}{% endfor %}</td></tr>
+          <tr><th scope="row">{% trans "Max runtime" %}</th><td>{{ object.max_runtime }}</td></tr>
+          <tr><th scope="row">{% trans "zstd level" %}</th><td>{{ object.zstd_level }}</td></tr>
+          <tr><th scope="row">{% trans "Enabled" %}</th><td>{% checkmark object.enabled %}</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="card-header">{% trans "Retention" %}</h2>
+        <table class="table table-hover attr-table">
+          {% for k, v in object.retention.items %}<tr><th scope="row"><code>{{ k }}</code></th><td>{{ v }}</td></tr>{% endfor %}
+        </table>
+      </div>
+    </div>
+    <div class="col col-12 col-md-6">
+      <div class="card">
+        <h2 class="card-header">{% trans "Next runs" %}</h2>
+        <ul class="list-group list-group-flush">
+          {% for run in next_runs %}<li class="list-group-item">{{ run|isodatetime }}</li>{% empty %}<li class="list-group-item text-muted">{% trans "Not scheduled" %}</li>{% endfor %}
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2 class="card-header">{% trans "Recent sets" %}</h2>
+    {% render_table recent_sets 'inc/table.html' %}
+  </div>
+{% endblock %}

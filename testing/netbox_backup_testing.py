@@ -10,8 +10,9 @@ ALLOWED_HOSTS = ['*']
 DATABASES = {
     'default': {
         'NAME': os.environ.get('NETBOX_DB_NAME', 'netbox'),
-        'USER': 'netbox',
-        'PASSWORD': 'netbox',
+        # CI runs as a non-superuser role that owns its databases, as on a shared PaaS server
+        'USER': os.environ.get('NETBOX_DB_USER', 'netbox'),
+        'PASSWORD': os.environ.get('NETBOX_DB_PASSWORD', 'netbox'),
         'HOST': 'localhost',
         'PORT': '',
         'CONN_MAX_AGE': 300,
@@ -22,13 +23,10 @@ PLUGINS = [
     'netbox_backup',
 ]
 
+# Tests configure targets, policies and generated keys per test case
 PLUGINS_CONFIG = {
     'netbox_backup': {
-        'storage': {
-            'backend': 'local',
-            'path': os.environ.get('NETBOX_BACKUP_STORAGE', '/tmp/netbox-backup-tests/storage'),
-        },
-        'work_dir': '/tmp/netbox-backup-tests/work',
+        'instance_id': '0b1d3c5e-7f90-4a1b-8c2d-3e4f5a6b7c8d',
     },
 }
 

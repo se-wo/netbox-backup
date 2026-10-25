@@ -1,90 +1,100 @@
-# Backup Essentials
+# Backup essentials
 
-The short version: set backups up once, check them, and know how to restore onto a new host.
-[Backup and Restore in Depth](backup-and-restore.md) covers the details.
+The short version: set backups up once, check them, rehearse a restore, and know how to recover onto a new host.
+[Backup and restore in depth](backup-and-restore.md) has the details.
 
 ## What is protected
 
-| Kind | Contents | Default schedule |
-|---|---|---|
-| **Database** backup | PostgreSQL dump of the NetBox database (all core and plugin tables) | Daily, **on** |
-| **Full** backup | Database + `MEDIA_ROOT` + `SCRIPTS_ROOT` + `REPORTS_ROOT` + configuration files* | **Off** |
+| Component | Contents |
+|---|---|
+| database | The NetBox database, every schema the NetBox role owns (core, plugins, netbox-branching branches) |
+| media | Image attachments and every other uploaded file, read through `STORAGES['default']` (local disk, S3 or blob) |
+| scripts | Uploaded custom scripts, read through `STORAGES['scripts']` |
+| config | `configuration.py` and `ldap_config.py`, **secrets included**, plus the plugin list and pip freeze |
 
-\* Configuration (`configuration.py`, `ldap_config.py`, any `extra_configuration_files`) holds `SECRET_KEY`,
-`API_TOKEN_PEPPERS` and database credentials. It is included only when encryption is on, unless you set
-`include_configuration: True`.
-
-Not protected: Redis (cache and queue only, safe to lose), static files (regenerate with `collectstatic`), the
-Python environment, and media held in remote object storage (`STORAGES` with django-storages). Back those up with
-the object store's own versioning or replication.
+Not protected: Redis (cache and queue only; queued jobs are lost on restore), static files (`collectstatic`
+regenerates them), other services' databases (Diode and the like), whole hosts or clusters (use Velero, restic or VM
+snapshots for that layer).
 
 ## 1. Set up once
 
-1. Install the plugin and the PostgreSQL client tools on the NetBox host. The client must be the **same major
-   version as the server, or newer** (`pg_dump --version`).
-2. Choose **off-host storage**. A backup on the same disk as the database is not a disaster-recovery backup. Use
-   an S3 bucket or a mounted NFS share. Give each NetBox instance its own bucket or prefix.
-3. Generate an encryption key with `manage.py netbox_backup genkey`. Store it **in your password manager as
-   well** as in `configuration.py`, because the backups cannot be restored without it.
-4. Enable full backups, for example `'full_backup_interval': 1440`.
-5. Run `manage.py migrate`, restart `netbox` and `netbox-rq`, then take a first backup:
+1. Install the plugin, GnuPG 2.4+ and the newest `postgresql-client` on the NetBox host and the worker.
+2. Pick an **off-host target with immutability**: an S3 bucket with object lock (COMPLIANCE default retention, e.g.
+   35 days) and a lifecycle rule aborting incomplete uploads after one day, or an Azure container with locked
+   version-level immutability. A set on the database's own disk is not a DR backup.
+3. Generate three keys with `nbbackup keys generate --role ops|signing|recovery`. The **ops** key decrypts
+   restores; keep it in a secret store and mount it only for restores. The **recovery** key is generated offline
+   with a passphrase and stays offline (a printout, a smartcard, a safe): it is the last way in, and the only key
+   that decrypts the config component with `SECRET_KEY`, the token peppers and the database password. The
+   **signing** key (with a passphrase) stays on the worker.
+4. Write the static configuration ([reference](configuration.md)) and **pin `instance_id`**.
+5. Run `manage.py migrate`, start a worker for `netbox_backup.netbox_backup`, then:
 
    ```bash
-   python manage.py netbox_backup create --full --verify restore
+   python manage.py nbbackup target probe     # every required check must pass
+   python manage.py nbbackup run              # the first set; verified at level 1
    ```
 
-## 2. Check regularly
+6. Put together the **DR kit** and keep it off this infrastructure (see [the DR kit](backup-and-restore.md#the-dr-kit)):
+   storage credentials, the public keys and fingerprints, the recovery key and its passphrase, the `instance_id`,
+   the direct (not pooled) database DSN, and a NetBox image of the same version with the plugin.
+
+## 2. Check it
 
 ```bash
-python manage.py netbox_backup status          # exit code: 0 ok/info, 1 warning, 2 error
+python manage.py nbbackup status          # exit code: 0 ok, 1 warning, 2 error
+netbox-backup --config /etc/netbox-backup.json check --max-age 26h    # from outside NetBox
 ```
 
-You can also open **Backup & Recovery → Status** in the UI, or call `GET /api/plugins/backup/status/`. Wire the
-exit code or the API into your monitoring. The conditions that matter most:
+Or open **Backup → Status**, or add the *Backup health* dashboard widget. Health is green only if every enabled
+policy produced a verified set within its interval + max_runtime + 1 hour **and** at least one verified, locked
+off-site copy exists. With `METRICS_ENABLED`, alert on the gauges in [the reference](reference.md#metrics).
 
-* **BackupAvailable**: a successful backup exists and is not stale (older than 2× the shortest interval).
-* **LastBackupSucceeded**: the most recent run did not fail.
-* **RestoreTested**: at least one backup has passed a *test restore*. Schedule one regularly from the UI
-  (*Verify → Test restore*) or with `netbox_backup verify latest --level restore`.
-* **StorageIsolated**: no other instance writes to the same location.
+## 3. Rehearse a restore
 
-A backup that reports *Completed* is not proven restorable until it has passed a test restore. Test-restore
-verification restores the dump into a scratch database and compares every table's row count with the manifest.
-
-## 3. Restore onto a new host
-
-1. Install the **same NetBox version** as the backup (or newer) with the same plugins, following the normal
-   NetBox installation guide up to and including creating an empty database. Do **not** run `migrate`.
-2. Install this plugin with the **same `PLUGINS_CONFIG['netbox_backup']`**: same storage, same `encryption_key`,
-   and the same `SECRET_KEY`, or the same explicit `instance_id`. The instance ID is derived from `SECRET_KEY`
-   unless set explicitly, and a restore only offers that instance's backups.
-
-   If the original `configuration.py` is lost, fetch it from a full backup on any host that has the key:
-
-   ```bash
-   python manage.py netbox_backup download latest-full /tmp/recovered   # decrypts into /tmp/recovered
-   tar -xzf /tmp/recovered/configuration.tar.gz -C /tmp/recovered
-   ```
-
-3. Restore:
-
-   ```bash
-   python manage.py netbox_backup list
-   python manage.py netbox_backup restore latest-full --dry-run
-   python manage.py netbox_backup restore latest-full
-   ```
-
-   An empty target database is detected automatically; no safety backup is taken in that case.
-4. Run `manage.py collectstatic --no-input`, then start `netbox` and `netbox-rq`.
-5. Log in and spot-check. The restore record (**Backup & Recovery → Restores**) shows the row-count verification.
-
-## Restoring on the same host (rollback)
+A healthy backup doesn't prove restored data. With a restore slot configured, run a drill now and again (monthly is
+a good default):
 
 ```bash
-sudo systemctl stop netbox netbox-rq
-python manage.py netbox_backup restore <name>
-sudo systemctl start netbox netbox-rq
+python manage.py nbbackup verify latest --drill --headroom-confirmed
 ```
 
-A safety backup of the current state is taken first. Its name is printed, so the restore can be undone with
-`netbox_backup restore <safety-backup-name>`.
+It loads the set into the slot, compares the baseline, checks the migration plan and empties the slot again. A pass
+marks the set as level 2 (QA restore).
+
+## 4. Undo a mistake (bulk edit gone wrong)
+
+```bash
+python manage.py nbbackup restore plan latest
+# with a slot: load, switch, finish (see the README); without one:
+python manage.py nbbackup restore load latest --in-place --confirm netbox
+```
+
+In place takes a verified safety set first. `restore rollback --confirm netbox` returns to it, and
+`restore finalize` cleans up after the rollback window.
+
+## 5. Recover onto a new host
+
+1. Install NetBox (same or newer version), the same plugins, this plugin, GnuPG and the PostgreSQL client tools.
+2. Restore the configuration. It is in the set's config component:
+
+   ```bash
+   netbox-backup --config nbb.json decrypt latest --components config --out /tmp/recovered
+   ```
+
+   `nbb.json` holds the plugin's dict: targets with their credential references, `crypto` with the recovery key as
+   identity, and the pinned `instance_id`. `config.json` in the output contains `configuration.py` verbatim, so
+   `SECRET_KEY` and `API_TOKEN_PEPPERS` match and API tokens keep working.
+3. Create an empty database owned by the NetBox role, point `configuration.py` at it, and restore:
+
+   ```bash
+   python manage.py nbbackup restore plan latest
+   python manage.py nbbackup restore load latest --in-place     # an empty database needs no --confirm
+   ```
+
+   The load reads storage directly and finishes in the same run: migrations, media, sessions, job state.
+4. Start NetBox and the workers. A full backup is already queued.
+
+If no NetBox image boots at all, `netbox-backup restore-db latest --dsn postgresql://netbox@db/netbox --confirm
+netbox` loads the database with only the configuration file and gpg. Run `nbbackup restore finish` once NetBox
+starts.

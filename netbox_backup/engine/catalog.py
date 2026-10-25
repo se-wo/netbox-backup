@@ -1,231 +1,197 @@
 """
-The backup catalog: manifests in storage are authoritative; Backup rows are a synchronised cache of them.
+The database catalog is a cache. Static config is mirrored into StorageTarget/BackupPolicy rows, and BackupSet/
+BackupCopy rows are rebuilt from the manifests in storage by sync(), which runs after every restore.
 """
-import contextlib
-import json
 import logging
-import os
+from datetime import timedelta
 
-from django.db import connection
-from django.utils.dateparse import parse_datetime
+from django.db import transaction
+from django.utils import timezone
 
 from .. import conf
-from ..choices import BackupStatusChoices
-from ..storage import StorageError, get_storage
-from . import crypto
-from .backup import (
-    ADVISORY_LOCK_KEY,
-    MANIFEST_FORMAT,
-    MANIFEST_NAME,
-    BackupError,
-    location_of,
-    sha256_file,
-    storage_key,
-)
+from ..choices import CopyStatusChoices, SetStatusChoices, TriggerChoices, VerifyLevelChoices
+from ..core import layout, sets
+from ..core.gpg import GPGError, Keyring
+from ..core.manifest import ManifestError
+from ..core.manifest import verify as manifest_verify
+from ..storage import StorageError, get_backend
 
 logger = logging.getLogger('netbox_backup')
 
-
-def read_manifest(storage, instance_id, name):
-    try:
-        data = storage.get_bytes(storage_key(instance_id, name, MANIFEST_NAME))
-    except StorageError:
-        return None
-    try:
-        manifest = json.loads(data)
-    except ValueError:
-        return None
-    if not str(manifest.get('format', '')).startswith('netbox-backup/'):
-        return None
-    return manifest
+EXPIRED_ROW_DAYS = 90
 
 
-def list_instances(storage=None):
-    storage = storage or get_storage()
-    return storage.list_children('')
-
-
-def list_manifests(instance_id=None, storage=None):
+def sync_static(config=None):
     """
-    Every complete backup in storage for an instance (default: this one), oldest first.
+    Mirror targets and policies from static config. Rows for entries removed from config are disabled, never
+    deleted, so the sets that reference them stay intact.
     """
-    storage = storage or get_storage()
-    instance_id = instance_id or conf.instance_id()
-    manifests = []
-    for name in storage.list_children(instance_id):
-        if manifest := read_manifest(storage, instance_id, name):
-            manifests.append(manifest)
-    return sorted(manifests, key=lambda m: m.get('started_at', ''))
+    from ..models import BackupPolicy, StorageTarget
+    config = config or conf.get_config()
+    targets = {}
+    with transaction.atomic():
+        for name, target in config.targets.items():
+            try:
+                location = get_backend(target).describe()
+            except StorageError as e:
+                location = f'unavailable: {e}'
+            public = target.public_dict()
+            obj, _ = StorageTarget.objects.update_or_create(name=name, defaults={
+                'backend': target.backend, 'config': public['options'], 'secret_refs': public['credentials'],
+                'prefix': target.prefix, 'location': location, 'retention_days': target.retention_days,
+                'quota_bytes': target.quota_bytes, 'offsite': target.offsite, 'is_static': True, 'enabled': True,
+            })
+            targets[name] = obj
+        StorageTarget.objects.exclude(name__in=list(config.targets)).update(enabled=False)
+        for name, policy in config.policies.items():
+            obj, _ = BackupPolicy.objects.update_or_create(name=name, defaults={
+                'components': list(policy.components), 'schedule': policy.schedule or '',
+                'time_zone': policy.time_zone or '', 'primary_target': targets[policy.target],
+                'retention': policy.retention.as_dict(), 'recipients': list(config.crypto.all_recipients),
+                'zstd_level': policy.zstd_level, 'verify_schedule': policy.verify_schedule or '',
+                'max_runtime': policy.max_runtime, 'enabled': policy.enabled, 'is_static': True,
+            })
+            obj.replica_targets.set([targets[r] for r in policy.replicas])
+        BackupPolicy.objects.exclude(name__in=list(config.policies)).update(enabled=False)
+    return targets
 
 
-def incomplete_backups(instance_id=None, storage=None):
+def set_fields_from_header(header):
     """
-    Directories in storage without a manifest (interrupted uploads).
+    Catalog fields recoverable from a signed header alone (no key needed).
     """
-    storage = storage or get_storage()
-    instance_id = instance_id or conf.instance_id()
-    return [
-        name for name in storage.list_children(instance_id)
-        if not storage.exists(storage_key(instance_id, name, MANIFEST_NAME))
-    ]
-
-
-def resolve(identifier, instance_id=None, storage=None):
-    """
-    Find a manifest by backup name, by unambiguous name prefix, or the keyword "latest" / "latest-full".
-    """
-    manifests = [
-        m for m in list_manifests(instance_id, storage) if m.get('status') != BackupStatusChoices.STATUS_FAILED
-    ]
-    if not manifests:
-        raise BackupError(f"No backups found for instance {instance_id or conf.instance_id()}")
-    if identifier in ('latest', 'latest-full', 'latest-database'):
-        kind = identifier.partition('-')[2]
-        candidates = [m for m in manifests if not kind or m['kind'] == kind]
-        if not candidates:
-            raise BackupError(f"No {kind} backups found")
-        return candidates[-1]
-    exact = [m for m in manifests if m['name'] == identifier]
-    if exact:
-        return exact[0]
-    matches = [m for m in manifests if m['name'].startswith(identifier)]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise BackupError(f"Backup {identifier!r} not found")
-    raise BackupError(f"{identifier!r} is ambiguous: {', '.join(m['name'] for m in matches)}")
-
-
-def _fields_from_manifest(manifest, storage):
+    from django.utils.dateparse import parse_datetime
+    components = {}
+    for name, obj in header.get('objects', {}).items():
+        component = layout.COMPONENT_BY_OBJECT.get(name)
+        if component:
+            components[component] = {
+                'object': name, 'size': obj['size'], **header.get('components', {}).get(component, {}),
+            }
     return {
-        'instance_id': manifest['instance_id'],
-        'kind': manifest['kind'],
-        'status': manifest.get('status', BackupStatusChoices.STATUS_COMPLETED),
-        'trigger': manifest.get('trigger', ''),
-        'requested_by': manifest.get('requested_by', ''),
-        'started_at': parse_datetime(manifest['started_at']) if manifest.get('started_at') else None,
-        'completed_at': parse_datetime(manifest['completed_at']) if manifest.get('completed_at') else None,
-        'size': manifest.get('size'),
-        'encrypted': bool(manifest.get('encryption', {}).get('enabled')),
-        'netbox_version': manifest.get('netbox', {}).get('version', ''),
-        'location': location_of(storage, manifest['instance_id'], manifest['name']),
-        'manifest': manifest,
-        'error': '',
+        'instance_id': header['instance_id'],
+        'policy_name': header.get('policy', ''),
+        'trigger': header.get('trigger') or TriggerChoices.SCHEDULED,
+        'started': parse_datetime(header['created_at']) if header.get('created_at') else None,
+        'finished': parse_datetime(header['finished_at']) if header.get('finished_at') else None,
+        'netbox_version': header.get('netbox_version', ''),
+        'size_bytes': sum(o['size'] for o in header.get('objects', {}).values()),
+        'components': components,
+        'warnings': header.get('warnings', []),
     }
 
 
-def sync(log=None, storage=None):
+def sync(config=None, log=None, keyring=None):
+    if keyring is None and (config or conf.get_config()).crypto.configured:
+        try:
+            with Keyring((config or conf.get_config()).crypto) as own:
+                return _sync(config, log, own)
+        except GPGError as e:
+            (log or logger).warning(f"Catalog sync: signatures cannot be checked ({e}); importing nothing")
+            return {'created': 0, 'updated': 0, 'expired': 0, 'errors': 1}
+    return _sync(config, log, keyring)
+
+
+def _sync(config=None, log=None, keyring=None):
     """
-    Reconcile Backup rows with storage. Returns a dict of counts.
+    Rebuild BackupSet/BackupCopy rows for this instance from every target. Sets that disappeared from all targets
+    are marked expired; expired rows older than 90 days are deleted. Returns counts.
     """
-    from ..models import Backup
+    from ..models import BackupCopy, BackupPolicy, BackupSet
     log = log or logger
-    storage = storage or get_storage()
-    instance_id = conf.instance_id()
-    stats = {'created': 0, 'updated': 0, 'missing': 0, 'interrupted': 0}
-
-    manifests = {m['name']: m for m in list_manifests(instance_id, storage)}
-    for name, manifest in manifests.items():
-        fields = _fields_from_manifest(manifest, storage)
-        backup = Backup.objects.filter(name=name).first()
-        if backup is None:
-            Backup.objects.create(name=name, **fields)
-            stats['created'] += 1
-        elif any(getattr(backup, k) != v for k, v in fields.items() if k != 'manifest') or backup.manifest != manifest:
-            for k, v in fields.items():
-                setattr(backup, k, v)
-            backup.save()
-            stats['updated'] += 1
-
-    # Rows whose backup has vanished from storage
-    for backup in Backup.objects.filter(instance_id=instance_id, status__in=BackupStatusChoices.SUCCESSFUL):
-        if backup.name not in manifests:
-            backup.status = BackupStatusChoices.STATUS_MISSING
-            backup.save()
-            stats['missing'] += 1
-
-    # Rows left "running" by a process that died, or captured mid-backup in a dump that was later restored. Only
-    # safe to judge when no backup currently holds the lock.
-    with _lock_if_free() as free:
-        if free:
-            stale = Backup.objects.filter(
-                status__in=(BackupStatusChoices.STATUS_RUNNING, BackupStatusChoices.STATUS_PENDING)
-            ).exclude(name__in=manifests.keys())
-            for backup in stale:
-                if backup.job and backup.job.status in ('pending', 'scheduled', 'running'):
-                    continue
-                backup.status = BackupStatusChoices.STATUS_FAILED
-                backup.error = backup.error or (
-                    'Interrupted: the process creating this backup stopped before it finished'
-                )
-                backup.save()
-                stats['interrupted'] += 1
-
-    log.info(
-        f"Catalog sync: {stats['created']} imported, {stats['updated']} updated, "
-        f"{stats['missing']} missing from storage, {stats['interrupted']} interrupted"
-    )
+    config = config or conf.get_config()
+    targets = sync_static(config)
+    instance_id = config.instance_id
+    if instance_id is None:
+        log.info("Catalog sync: no instance_id yet (unpinned, no backup taken)")
+        return {'created': 0, 'updated': 0, 'expired': 0, 'errors': 0}
+    stats = {'created': 0, 'updated': 0, 'expired': 0, 'errors': 0}
+    seen = set()
+    policies = {p.name: p for p in BackupPolicy.objects.all()}
+    for name, target in config.targets.items():
+        try:
+            backend = get_backend(target)
+            listings = sets.list_sets(backend, instance_id)
+        except StorageError as e:
+            log.warning(f"Catalog sync: target {name} unavailable: {e}")
+            stats['errors'] += 1
+            continue
+        for listing in listings:
+            if not listing.complete:
+                continue
+            try:
+                manifest = sets.load_manifest(backend, instance_id, listing.set_id)
+                if keyring is not None:
+                    # Only a correctly signed manifest behind a matching _COMPLETE counts; it then overrides a
+                    # catalog row that says the set failed
+                    manifest_verify(manifest, keyring)
+            except (sets.SetError, ManifestError, StorageError, GPGError) as e:
+                log.warning(f"Catalog sync: set {listing.set_id} on {name}: {e}")
+                stats['errors'] += 1
+                continue
+            seen.add(listing.set_id)
+            fields = set_fields_from_header(manifest.header)
+            fields['policy'] = policies.get(fields['policy_name'])
+            fields['manifest_sha384'] = manifest.sha384
+            backup_set = BackupSet.objects.filter(set_id=listing.set_id).first()
+            if backup_set is None:
+                backup_set = BackupSet.objects.create(set_id=listing.set_id, status=SetStatusChoices.UPLOADED,
+                                                      **fields)
+                stats['created'] += 1
+            else:
+                changed = False
+                for key in ('manifest_sha384', 'size_bytes', 'finished'):
+                    if getattr(backup_set, key) != fields[key]:
+                        setattr(backup_set, key, fields[key])
+                        changed = True
+                if backup_set.status in (SetStatusChoices.EXPIRED, SetStatusChoices.RUNNING,
+                                         SetStatusChoices.PENDING, SetStatusChoices.FAILED):
+                    backup_set.status = SetStatusChoices.UPLOADED
+                    backup_set.expired_at = None
+                    changed = True
+                if changed:
+                    backup_set.save()
+                    stats['updated'] += 1
+            retain = [o.retain_until for o in listing.objects.values() if o.retain_until]
+            BackupCopy.objects.update_or_create(set=backup_set, target=targets[name], defaults={
+                'status': CopyStatusChoices.UPLOADED if not BackupCopy.objects.filter(
+                    set=backup_set, target=targets[name], status=CopyStatusChoices.VERIFIED).exists()
+                else CopyStatusChoices.VERIFIED,
+                'is_primary': bool(fields['policy'] and fields['policy'].primary_target_id == targets[name].pk),
+                'locked_until': min(retain) if retain else None,
+            })
+    # Sets no target holds any more
+    now = timezone.now()
+    gone = BackupSet.objects.filter(instance_id=instance_id, status__in=SetStatusChoices.USABLE).exclude(
+        set_id__in=seen)
+    if stats['errors'] == 0:
+        for backup_set in gone:
+            backup_set.status = SetStatusChoices.EXPIRED
+            backup_set.expired_at = now
+            backup_set.save(update_fields=('status', 'expired_at'))
+            backup_set.copies.update(status=CopyStatusChoices.DELETED)
+            stats['expired'] += 1
+    BackupSet.objects.filter(status=SetStatusChoices.EXPIRED,
+                             expired_at__lt=now - timedelta(days=EXPIRED_ROW_DAYS)).delete()
+    log.info(f"Catalog sync: {stats['created']} imported, {stats['updated']} updated, {stats['expired']} expired")
     return stats
 
 
-@contextlib.contextmanager
-def _lock_if_free():
-    with connection.cursor() as cursor:
-        cursor.execute('SELECT pg_try_advisory_lock(%s)', [ADVISORY_LOCK_KEY])
-        acquired = cursor.fetchone()[0]
-    try:
-        yield acquired
-    finally:
-        if acquired:
-            with connection.cursor() as cursor:
-                cursor.execute('SELECT pg_advisory_unlock(%s)', [ADVISORY_LOCK_KEY])
-
-
-class ArtifactError(BackupError):
-    pass
-
-
-def fetch_artifacts(manifest, workdir, types=None, storage=None, key=None, log=None):
+def mark_level(backup_set, results, level=VerifyLevelChoices.INTEGRITY, target=None):
     """
-    Download, integrity-check and decrypt a backup's artifacts into workdir. Returns {type: plaintext path}.
+    Record a verification result on a set (and its copy on target).
     """
-    log = log or logger
-    storage = storage or get_storage()
-    encryption = manifest.get('encryption') or {}
-    if encryption.get('enabled'):
-        key = key or conf.encryption_key()
-        if not key:
-            raise ArtifactError("This backup is encrypted but no encryption_key is configured")
-        expected = encryption.get('key_fingerprint')
-        if expected and crypto.key_fingerprint(key) != expected:
-            raise ArtifactError(
-                f"The configured encryption_key does not match the key this backup was made with "
-                f"(fingerprint {crypto.key_fingerprint(key)}, expected {expected})"
-            )
-    result = {}
-    for artifact in manifest.get('artifacts', []):
-        if types is not None and artifact['type'] not in types:
-            continue
-        stored = os.path.join(workdir, artifact['name'])
-        log.info(f"Downloading {artifact['name']} ({artifact['size']} bytes)")
-        storage.get_file(storage_key(manifest['instance_id'], manifest['name'], artifact['name']), stored)
-        if os.path.getsize(stored) != artifact['size']:
-            raise ArtifactError(f"{artifact['name']}: size {os.path.getsize(stored)} != {artifact['size']}")
-        if sha256_file(stored) != artifact['sha256']:
-            raise ArtifactError(f"{artifact['name']}: checksum mismatch (corrupted in storage?)")
-        plaintext = stored
-        if artifact.get('encrypted'):
-            plaintext = stored.removesuffix('.enc')
-            crypto.decrypt_file(stored, plaintext, key)
-            os.unlink(stored)
-            if sha256_file(plaintext) != artifact['plaintext_sha256']:
-                raise ArtifactError(f"{artifact['name']}: decrypted content checksum mismatch")
-        result[artifact['type']] = plaintext
-    if types is not None and (absent := set(types) - set(result)):
-        raise ArtifactError(f"Backup has no {', '.join(sorted(absent))} artifact")
-    return result
-
-
-def check_format(manifest):
-    if manifest.get('format') != MANIFEST_FORMAT:
-        raise BackupError(f"Unsupported backup format {manifest.get('format')!r} (expected {MANIFEST_FORMAT})")
+    ok = bool(results) and all(r['ok'] for r in results)
+    now = timezone.now()
+    if target is not None:
+        backup_set.copies.filter(target__name=target).update(
+            verify_level=level if ok else VerifyLevelChoices.NONE, verified=now if ok else None,
+            verify_detail=results, status=CopyStatusChoices.VERIFIED if ok else CopyStatusChoices.FAILED,
+        )
+    if ok:
+        backup_set.verify_level = max(backup_set.verify_level, level)
+        backup_set.verified_at = now
+        if backup_set.status == SetStatusChoices.UPLOADED:
+            backup_set.status = SetStatusChoices.VERIFIED
+    backup_set.save()
+    return ok

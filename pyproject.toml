@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netbox-backup"
-version = "0.1.0"
+version = "0.2.0.dev0"
 description = "Open-source backup, verification and disaster recovery for NetBox"
 readme = "README.md"
 license = "Apache-2.0"
@@ -16,12 +16,20 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: System :: Archiving :: Backup",
 ]
-dependencies = []
+# The core install pulls no cloud SDKs; encryption and signatures use the gpg binary (GnuPG 2.4+)
+dependencies = [
+    "croniter>=2.0",
+    "zstandard>=0.22",
+    "psycopg>=3.1",
+]
 
 [project.optional-dependencies]
-s3 = ["boto3>=1.28"]
-encryption = ["cryptography>=41"]
-all = ["boto3>=1.28", "cryptography>=41"]
+s3 = ["boto3>=1.35"]
+azure = ["azure-storage-blob>=12.19", "azure-identity>=1.15"]
+all = ["boto3>=1.35", "azure-storage-blob>=12.19", "azure-identity>=1.15"]
+
+[project.scripts]
+netbox-backup = "netbox_backup.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/se-wo/netbox-backup"
