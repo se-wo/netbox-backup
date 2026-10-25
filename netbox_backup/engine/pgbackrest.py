@@ -11,6 +11,7 @@ from datetime import datetime
 from django.utils import timezone
 
 from .. import conf
+from ..core.config import parse_duration
 
 
 class PgBackRestError(Exception):
@@ -18,7 +19,7 @@ class PgBackRestError(Exception):
 
 
 def settings():
-    value = conf.get('pgbackrest')
+    value = conf.get_config().pgbackrest
     if not value or not value.get('stanza'):
         return None
     return {'binary': 'pgbackrest', 'max_age': '2 days', **value}
@@ -69,7 +70,7 @@ def condition():
     if cfg is None:
         return None
     try:
-        status, message = summarize(info(cfg), conf.parse_duration(cfg.get('max_age')))
+        status, message = summarize(info(cfg), parse_duration(cfg.get('max_age'), default_unit='days'))
     except (PgBackRestError, subprocess.TimeoutExpired, ValueError, KeyError) as e:
         status, message = 'error', f"pgBackRest check failed: {e}"
     return Condition('PointInTimeRecovery', status, message)

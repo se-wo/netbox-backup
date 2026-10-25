@@ -179,6 +179,11 @@ class BackupRunner:
             db_size, server_version = cursor.fetchone()
             server_major = conn.info.server_version // 10000
             grantees = pgcore.grantees(cursor)
+            cursor.execute("SELECT to_regclass('users_token') IS NOT NULL")
+            peppers = []
+            if cursor.fetchone()[0]:
+                cursor.execute('SELECT DISTINCT pepper_id FROM users_token WHERE pepper_id IS NOT NULL')
+                peppers = sorted(row[0] for row in cursor.fetchall())
             schemas = pgcore.user_schemas(cursor)
             references = components.referenced_files(cursor) if set(self.components) & {'media', 'scripts'} \
                 else {}
@@ -261,6 +266,7 @@ class BackupRunner:
             'hostname': socket.gethostname(),
             'database': {'name': db.name, 'size_bytes': db_size, 'schemas': schemas, 'grantees': grantees},
             'baseline': baseline,
+            'token_peppers': peppers,
             'components': self.summaries,
             'warnings': self.warnings,
         }

@@ -3,8 +3,17 @@ import time
 import uuid
 from datetime import UTC, datetime
 
-from .base import Capabilities, DeleteError, ObjectExists, ObjectInfo, ObjectNotFound, ProbeReport, StorageBackend, \
-    StorageError, Writer
+from .base import (
+    Capabilities,
+    DeleteError,
+    ObjectExists,
+    ObjectInfo,
+    ObjectNotFound,
+    ProbeReport,
+    StorageBackend,
+    StorageError,
+    Writer,
+)
 
 PART_SUFFIX = '.part'
 

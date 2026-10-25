@@ -118,8 +118,12 @@ class RestoreStatusChoices(ChoiceSet):
 class RestoreStrategyChoices(ChoiceSet):
     SLOT = 'slot'
     IN_PLACE = 'in-place'
+    MEDIA = 'media'
+    DRILL = 'drill'
 
     CHOICES = (
         (SLOT, _('Restore slot')),
         (IN_PLACE, _('In place')),
+        (MEDIA, _('Media only')),
+        (DRILL, _('Drill (QA restore in the slot)')),
     )

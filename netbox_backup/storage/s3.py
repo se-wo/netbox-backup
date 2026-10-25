@@ -14,8 +14,18 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 from ..core.config import resolve_secret
-from .base import Capabilities, DeleteError, ObjectExists, ObjectInfo, ObjectNotFound, ProbeReport, StorageBackend, \
-    StorageError, Writer, md5_etag
+from .base import (
+    Capabilities,
+    DeleteError,
+    ObjectExists,
+    ObjectInfo,
+    ObjectNotFound,
+    ProbeReport,
+    StorageBackend,
+    StorageError,
+    Writer,
+    md5_etag,
+)
 
 MiB = 1024 * 1024
 MIN_PART = 8 * MiB

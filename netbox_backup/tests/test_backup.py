@@ -27,7 +27,6 @@ from netbox_backup.storage import get_backend
 
 from .utils import PluginConfigMixin
 
-
 PNG_1PX = base64.b64decode(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
 )

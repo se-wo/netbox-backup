@@ -11,8 +11,17 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from ..core.config import resolve_secret
-from .base import Capabilities, DeleteError, ObjectExists, ObjectInfo, ObjectNotFound, ProbeReport, StorageBackend, \
-    StorageError, Writer
+from .base import (
+    Capabilities,
+    DeleteError,
+    ObjectExists,
+    ObjectInfo,
+    ObjectNotFound,
+    ProbeReport,
+    StorageBackend,
+    StorageError,
+    Writer,
+)
 
 MiB = 1024 * 1024
 MIN_BLOCK = 8 * MiB
