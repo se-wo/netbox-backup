@@ -19,7 +19,11 @@ from . import catalog
 logger = logging.getLogger('netbox_backup')
 
 TICK_CACHE_KEY = 'netbox_backup:scheduler_tick'
+VERIFY_SLOT_CACHE_KEY = 'netbox_backup:verify_slot:{}'
+REPORTS_CACHE_KEY = 'netbox_backup:reports_imported'
 QUEUE = 'netbox_backup.netbox_backup'
+DAILY = timedelta(hours=24)
+HOURLY = timedelta(hours=1)
 
 
 def policy_tz(policy):
@@ -144,4 +148,62 @@ def tick(now=None, log=None):
     recent_prune = Job.objects.filter(name=PruneJob.name, created__gte=now - timedelta(hours=24)).exists()
     if config.targets and not recent_prune:
         enqueue_prune()
+    for task in (retry_replicas, schedule_verifications, periodic_checks):
+        try:
+            task(config, now, log)
+        except Exception as e:  # one failing housekeeping task must not keep the others from running
+            log.error(f"Scheduler: {task.__name__} failed: {type(e).__name__}: {e}")
     return enqueued
+
+
+def retry_replicas(config, now, log):
+    """
+    Failed or lost replica copies, retried an hour after the last attempt, at most MAX_ATTEMPTS times.
+    """
+    from ..jobs import enqueue_replicate
+    from ..models import BackupCopy, BackupSet
+    from .replicate import due_retries
+    for set_id, targets in due_retries(now).items():
+        policy = config.policies.get(BackupSet.objects.filter(set_id=set_id).values_list(
+            'policy_name', flat=True).first())
+        targets = [t for t in targets if t in config.targets]
+        if targets:
+            # Stamped now, so the next ticks don't enqueue it again while the job waits in the queue
+            BackupCopy.objects.filter(set__set_id=set_id, target__name__in=targets).update(last_attempt=now)
+            enqueue_replicate(set_id, targets=targets, timeout=policy.max_runtime if policy else None)
+            log.info(f"Set {set_id}: retrying replica(s) {', '.join(targets)}")
+
+
+def schedule_verifications(config, now, log):
+    """
+    A policy's verify_schedule re-runs level 1 on every usable set of the policy: objects still present, sizes and
+    checksums unchanged, locks still active. Like backups, the first tick only records the current slot.
+    """
+    from ..jobs import enqueue_verify
+    for name, policy in config.policies.items():
+        if not policy.enabled or not policy.verify_schedule:
+            continue
+        slot = croniter(policy.verify_schedule, now.astimezone(policy_tz(policy))).get_prev(datetime)
+        key = VERIFY_SLOT_CACHE_KEY.format(name)
+        last = cache.get(key)
+        cache.set(key, slot.timestamp(), None)
+        if last is not None and slot.timestamp() > last:
+            enqueue_verify(None, policy=name)
+            log.info(f"Policy {name}: enqueued scheduled level-1 verification")
+
+
+def periodic_checks(config, now, log):
+    """
+    Daily: the ownership check of the live database and the slot. Hourly: import QA restore reports.
+    """
+    from . import checks, qa
+    last = checks.last_ownership_check()
+    if last is None or now - datetime.fromisoformat(last['checked']) >= DAILY:
+        result = checks.check_ownership(config)
+        for problem in result['problems']:
+            log.warning(f"Ownership: {problem}")
+    if config.crypto.report_signers:
+        imported = cache.get(REPORTS_CACHE_KEY)
+        if imported is None or now.timestamp() - imported >= HOURLY.total_seconds():
+            cache.set(REPORTS_CACHE_KEY, now.timestamp(), None)
+            qa.import_reports(config, log=log)

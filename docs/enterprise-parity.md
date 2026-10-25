@@ -21,13 +21,13 @@ S3, and a manual kubectl procedure. This table maps every documented behaviour t
 | PITR leaves a timeline fork until the next full backup | pgBackRest error [058] | A full backup is enqueued right after any restore | Done |
 | S3 stores rejecting `STREAMING-UNSIGNED-PAYLOAD-TRAILER` fail with InvalidArgument | Velero AWS plugin v1.14.2 | `checksum_mode: when_required` | Done |
 | HA restore waits for 3 controller nodes | Embedded Cluster | Not applicable: a restore needs one database and one process | n/a |
-| Air-gapped installs unsupported for DR | Embedded Cluster | Supported via local/NFS targets (SFTP in M2) | Done |
+| Air-gapped installs unsupported for DR | Embedded Cluster | Supported via local/NFS and SFTP targets | Done |
 
 ## Roadmap
 
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 Core | Full sets; s3, azure_blob, local; GnuPG encryption and signing; signed manifest; GFS retention on bucket default retention; prune with a separate credential; restore in place or via marked slot and switch; level-1 integrity; metrics and alert rules; `status --json`; external check; standalone CLI | Implemented |
-| M2 Backends and drills | gcs, sftp, rclone; replicas (ReplicateJob); QA restore instance (scheduled QA restores, `finish --qa` reports signed with the QA key) | `verify --drill` and `finish --qa` exist; the rest is next |
+| M2 Backends and drills | gcs, sftp, rclone; replicas (ReplicateJob, server-side within a provider, recorded copy checksums); QA restore instance (`qa run`, `finish --qa` with `migrate --check` and an API smoke test, reports signed with the QA key and imported by production); scheduled drills measure server headroom | Implemented; exit criterion (monthly QA restore green on a reference install for 3 months) pending |
 | M3 Browse | Load a set into the slot read-only, diff objects against live, export selected objects | Planned |
 | Later | Incremental media; provider-clone load (`--from-dsn`); pgBackRest configuration for self-hosted servers | On demand |

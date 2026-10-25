@@ -80,8 +80,8 @@ class BackupCopyTable(NetBoxTable):
     class Meta(NetBoxTable.Meta):
         model = BackupCopy
         fields = ('pk', 'target', 'status', 'is_primary', 'uploaded', 'verified', 'verify_level', 'checksum_mode',
-                  'locked_until', 'error')
-        default_columns = ('target', 'status', 'is_primary', 'verify_level', 'checksum_mode', 'locked_until')
+                  'locked_until', 'attempts', 'last_attempt', 'error')
+        default_columns = ('target', 'status', 'is_primary', 'verify_level', 'checksum_mode', 'locked_until', 'error')
 
 
 class RestoreRunTable(NetBoxTable):

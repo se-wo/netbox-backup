@@ -15,6 +15,9 @@ BUILTIN_BACKENDS = {
     'local': 'netbox_backup.storage.local:LocalBackend',
     's3': 'netbox_backup.storage.s3:S3Backend',
     'azure_blob': 'netbox_backup.storage.azure_blob:AzureBlobBackend',
+    'gcs': 'netbox_backup.storage.gcs:GCSBackend',
+    'sftp': 'netbox_backup.storage.sftp:SFTPBackend',
+    'rclone': 'netbox_backup.storage.rclone:RcloneBackend',
 }
 
 

@@ -463,6 +463,42 @@ def lock_capacity(cursor):
     return cursor.fetchone()
 
 
+def foreign_lock_holders(cursor):
+    """
+    Roles other than the current one whose sessions hold locks on relations the current role owns in this
+    database: emptying it would wait for them (and the NetBox role cannot terminate their sessions).
+    """
+    cursor.execute("""
+        SELECT DISTINCT a.usename FROM pg_locks l
+        JOIN pg_stat_activity a ON a.pid = l.pid
+        JOIN pg_class c ON c.oid = l.relation
+        WHERE l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND pg_get_userbyid(c.relowner) = current_user AND a.usename <> current_user
+          AND l.pid <> pg_backend_pid()
+    """)
+    return sorted(row[0] for row in cursor.fetchall() if row[0])
+
+
+def server_usage(cursor, ignore=()):
+    """
+    (bytes used by every database on the server, [databases that cannot be measured]). pg_database_size needs
+    CONNECT on a database; one we cannot measure makes the total unknown unless it is ignored.
+    """
+    cursor.execute("""
+        SELECT datname, CASE WHEN has_database_privilege(datname, 'CONNECT') THEN pg_database_size(datname) END
+        FROM pg_database WHERE NOT datistemplate
+    """)
+    used, unknown = 0, []
+    for name, size in cursor.fetchall():
+        if name in ignore:
+            continue
+        if size is None:
+            unknown.append(name)
+        else:
+            used += size
+    return used, unknown
+
+
 def empty_database(conn, lock_timeout='10s'):
     """
     Return the database to the state of a fresh one: drop public and every other schema the role owns, recreate

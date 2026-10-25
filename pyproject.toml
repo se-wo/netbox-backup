@@ -26,7 +26,13 @@ dependencies = [
 [project.optional-dependencies]
 s3 = ["boto3>=1.35"]
 azure = ["azure-storage-blob>=12.19", "azure-identity>=1.15"]
-all = ["boto3>=1.35", "azure-storage-blob>=12.19", "azure-identity>=1.15"]
+gcs = ["google-cloud-storage>=2.18"]
+sftp = ["asyncssh>=2.14"]
+# rclone needs no Python package: install the rclone binary and pin its SHA-256 in the target
+all = [
+    "boto3>=1.35", "azure-storage-blob>=12.19", "azure-identity>=1.15", "google-cloud-storage>=2.18",
+    "asyncssh>=2.14",
+]
 
 [project.scripts]
 netbox-backup = "netbox_backup.cli:main"

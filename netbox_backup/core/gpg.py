@@ -122,6 +122,8 @@ class Keyring:
         self.home = tempfile.mkdtemp(prefix='nbb-gpg-')
         os.chmod(self.home, 0o700)
         self.signers = {crypto.signing_key, *crypto.trusted_signers, *extra_signers}
+        # Pinned for QA reports only: verify_detached never accepts them unless asked to (signers=...)
+        self.report_signers = set(getattr(crypto, 'report_signers', ()))
         self.passphrase_file = None
         self.last_decryption_key = None
         try:
@@ -197,7 +199,7 @@ class Keyring:
                 raise GPGError("No decryption identity is mounted (crypto.identities)")
             for ref in self.crypto.identities:
                 self._import_secret(ref, self.crypto.identity_passphrase)
-        pinned = set(self.crypto.all_recipients) | self.signers
+        pinned = set(self.crypto.all_recipients) | self.signers | self.report_signers
         keys = self.list_keys()
         # Keep only pinned keys, so a stray key in the public key file can never be used
         for fpr in set(keys) - pinned:

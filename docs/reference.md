@@ -9,18 +9,21 @@
 | `list [--target] [--instance] [--all-instances] [--json]` | Sets in storage (no catalog needed); `--all-instances` lists every instance on the target |
 | `show [<set>] [--json]` | Signed header, plus the decrypted body summary when an identity is mounted |
 | `verify [<set>]` | Level-1 check of every copy |
-| `verify [<set>] --drill [--headroom-confirmed]` | Level 2 on demand: load into the restore slot, check the baseline and migration plan, empty the slot |
+| `verify [<set>] --drill [--headroom-confirmed]` | Level 2 on demand: load into the restore slot, check the baseline and migration plan, empty the slot. With `headroom` configured the server is measured instead of `--headroom-confirmed` |
+| `replicate [<set>] [--target ...]` | Copy a set to its policy's replicas (or the named targets) and verify the copies; retries a failed copy |
 | `prune [--dry-run] [--target ...]` | Apply retention; deletes only with a prune credential. Reports held policies (newest sets unverified) and expired probe objects |
 | `slot init <database>` | Mark an empty database owned by the NetBox role as the restore slot |
 | `restore plan [<set>] [--from-instance] [--components] [--json]` | Preflight; recommends `--slot` or `--in-place` |
-| `restore load [<set>] --slot \| --in-place --confirm <db> [--skip-safety] [--revoke-resurrected]` | Load the set |
-| `restore finish [<restore>] [--qa] [--revoke-resurrected]` | After the switch: migrate, reset runtime state, write media |
+| `restore load [<set>] --slot \| --in-place --confirm <db> [--skip-safety] [--revoke-resurrected] [--qa]` | Load the set; `--qa` (QA instances, in place) finishes with `finish --qa` right away |
+| `restore finish [<restore>] [--qa] [--revoke-resurrected]` | After the switch: migrate, reset runtime state, write media. `--qa` adds `migrate --check` and an API smoke test and takes no post-restore backup |
 | `restore status [<restore>] [--json]` | Journals, local and from storage |
 | `restore rollback [<restore>] [--confirm <db>]` | Switch back (slot) or reload the safety set (in place) |
 | `restore finalize [<restore>] [--force]` | Empty the old database after `rollback_days` |
 | `restore media [<set>] [--components media scripts]` | Media alone, against the live database |
-| `catalog sync` | Rebuild sets and copies from storage |
-| `target probe [<name>]` | Pooled-session check on the database, then round trip, create-only check, a two-part upload with the target's encryption settings (ETag vs local MD5), default retention, lifecycle rule |
+| `qa run [<set>] --from-instance <prod id> --confirm <QA db> [--target]` | On a QA instance: load production's set in place, `finish --qa`, write a report signed with the QA key below the production instance, passed or failed |
+| `qa import` | On production: import the QA reports signed by `crypto.report_signers` (also hourly and on every catalog sync) |
+| `catalog sync` | Rebuild sets and copies from storage, then import QA reports |
+| `target probe [<name>]` | Pooled-session check and ownership check on the database, then per target: round trip, create-only check, a two-part upload with the target's encryption settings (ETag vs local MD5), default retention, lifecycle rule; for `local`, that the path is not on the database volume |
 | `keys generate --role ops\|recovery\|signing --name <uid> --out <dir> [--passphrase-env VAR]` | A brainpoolP384r1 key pair, written as `<fingerprint>.pub.asc` / `.sec.asc`; recovery and signing keys require `--passphrase-env` |
 | `status [--json] [--no-workers]` | Health; exits 0 ok, 1 warning, 2 error. pgBackRest is reported separately and doesn't affect the exit code |
 
@@ -49,7 +52,7 @@ from the DSN or `PGPASSWORD`.
 | `targets/`, `policies/` | GET | Read-only mirrors of static config |
 | `policies/{id}/run/` | POST | Manual backup; needs `netbox_backup.run_backuppolicy`. Returns 202 with the job |
 | `sets/` | GET | Filter by `policy_id`, `status`, `trigger`, `verify_level`, `target_id`, `started__after/before` |
-| `sets/{id}/download/` | POST | Off unless `allow_download`; superusers only; presigned URLs valid five minutes or less; ciphertext only |
+| `sets/{id}/download/` | POST | Off unless `allow_download`; superusers only; presigned URLs valid five minutes or less; ciphertext only; recorded in `<instance_id>/audit/` first, refused if that fails |
 | `restores/` | GET | Plans and journals |
 | `status/` | GET | One JSON health summary for monitoring |
 

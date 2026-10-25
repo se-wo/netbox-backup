@@ -8,6 +8,7 @@ from datetime import timedelta
 from core.exceptions import JobFailed
 from netbox.jobs import JobRunner, system_job
 
+from . import conf
 from .choices import TriggerChoices
 
 QUEUE = 'netbox_backup.netbox_backup'
@@ -27,13 +28,23 @@ def enqueue_backup(policy, trigger=TriggerChoices.SCHEDULED, user=None, created_
     )
 
 
-def enqueue_verify(set_id, user=None):
-    return VerifyJob.enqueue(user=user, set_id=set_id, queue_name=QUEUE,
+def enqueue_replicate(set_id, targets=None, timeout=None):
+    """
+    Copy a set to its replicas. A copy may take as long as the backup did, so it gets the policy's max_runtime.
+    """
+    return ReplicateJob.enqueue(set_id=set_id, targets=targets, queue_name=QUEUE,
+                                job_timeout=int((timeout or MIN_PRUNE_TIMEOUT).total_seconds()))
+
+
+def enqueue_verify(set_id, user=None, policy=None):
+    """
+    Level 1 of one set, or (policy=...) of every usable set of a policy.
+    """
+    return VerifyJob.enqueue(user=user, set_id=set_id, policy=policy, queue_name=QUEUE,
                              job_timeout=int(VERIFY_TIMEOUT.total_seconds()))
 
 
 def enqueue_prune(dry_run=False):
-    from . import conf
     runtimes = [p.max_runtime for p in conf.get_config().policies.values()]
     timeout = max([MIN_PRUNE_TIMEOUT, *runtimes])
     return PruneJob.enqueue(dry_run=dry_run, queue_name=QUEUE, job_timeout=int(timeout.total_seconds()))
@@ -47,22 +58,42 @@ class BackupJob(JobRunner):
         from .engine.backup import run_backup
         from .engine.locks import LockHeld
         try:
-            run_backup(policy, trigger=trigger, created_by=created_by, job=self.job, log=self.logger,
-                       components=components)
+            backup_set = run_backup(policy, trigger=trigger, created_by=created_by, job=self.job, log=self.logger,
+                                    components=components)
         except LockHeld as e:
             self.logger.error(str(e))
             raise JobFailed() from e
+        config = conf.get_config()
+        if config.policy(policy).replicas:
+            enqueue_replicate(backup_set.set_id, timeout=config.policy(policy).max_runtime)
         enqueue_prune()
+
+
+class ReplicateJob(JobRunner):
+    class Meta:
+        name = 'Backup replication'
+
+    def run(self, set_id, targets=None, **kwargs):
+        from .engine.replicate import replicate
+        results = replicate(set_id, targets=targets, log=self.logger)
+        self.job.data = {'set_id': set_id, 'copies': results}
+        if any(status != 'verified' for status in results.values()):
+            raise JobFailed()
 
 
 class VerifyJob(JobRunner):
     class Meta:
         name = 'Backup verification'
 
-    def run(self, set_id, **kwargs):
-        from .engine.verify import verify_set
-        ok = verify_set(set_id, log=self.logger)
-        self.job.data = {'set_id': set_id, 'passed': ok}
+    def run(self, set_id=None, policy=None, **kwargs):
+        from .engine.verify import verify_policy, verify_set
+        if policy:
+            results = verify_policy(policy, log=self.logger)
+            self.job.data = {'policy': policy, 'sets': results}
+            ok = all(results.values())
+        else:
+            ok = verify_set(set_id, log=self.logger)
+            self.job.data = {'set_id': set_id, 'passed': ok}
         if not ok:
             raise JobFailed()
 

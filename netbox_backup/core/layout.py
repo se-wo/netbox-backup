@@ -8,8 +8,9 @@ Object layout and set identifiers.
     <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/scripts.tar.zst.enc
     <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/config.json.enc
     <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/_COMPLETE
-    <prefix>/<instance_id>/journal/<restore_id>.json
-    <prefix>/<instance_id>/reports/...
+    <prefix>/<source instance_id>/journal/<restore_id>/<NNN>-<step>.json
+    <prefix>/<instance_id>/reports/<report_id>-<set_id>.json      (signed QA restore reports)
+    <prefix>/<instance_id>/audit/<event_id>-<event>.json          (downloads)
 
 set_id is a ULID, so keys sort by time on every backend. The storage driver adds <prefix>.
 """
@@ -19,6 +20,8 @@ import time
 from datetime import UTC, datetime
 
 INSTANCE_FILE = 'instance.json'
+REPORTS = 'reports'
+AUDIT = 'audit'
 MANIFEST = 'manifest.json'
 COMPLETE = '_COMPLETE'
 
@@ -75,8 +78,12 @@ def object_key(instance_id, set_id, name):
     return f'{set_prefix(instance_id, set_id)}/{name}'
 
 
-def journal_key(instance_id, restore_id):
-    return f'{instance_id}/journal/{restore_id}.json'
+def report_key(instance_id, report_id, set_id):
+    return f'{instance_id}/{REPORTS}/{report_id}-{set_id}.json'
+
+
+def audit_key(instance_id, event_id, event):
+    return f'{instance_id}/{AUDIT}/{event_id}-{event}.json'
 
 
 def parse_set_key(key):

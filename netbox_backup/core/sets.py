@@ -102,11 +102,15 @@ def load_manifest(backend, instance_id, set_id):
     return manifest
 
 
-def level1(backend, manifest, keyring, target=None):
+def level1(backend, manifest, keyring, target=None, expected=None):
     """
     Level-1 integrity: _COMPLETE hash (checked by load_manifest), header signature, and per object the size and the
     locally computed checksum against what the backend reports, plus retention status on immutable targets. Needs
     no private key. Returns a list of {'check', 'ok', 'detail'}; the overall verdict is all(ok).
+
+    The manifest records the checksums computed while writing to the primary target. A replica's objects were
+    written by a copy job with its own part layout, so its checks take the copy's records as expected
+    ({object name: {'checksum': {...}}}); a replica without records (e.g. a rebuilt catalog) is checked by size.
     """
     results = []
 
@@ -124,12 +128,14 @@ def level1(backend, manifest, keyring, target=None):
             record(f'{name}: present', False, obj['key'])
             continue
         record(f'{name}: size', info.size == obj['size'], f"{info.size} bytes, expected {obj['size']}")
-        if obj.get('checksum') and info.checksum_unavailable:
+        checksum = obj.get('checksum') if expected is None else (expected.get(name) or {}).get('checksum')
+        if checksum and info.checksum_unavailable:
             record(f'{name}: checksum', True, f'size only ({info.checksum_unavailable})')
-        elif obj.get('checksum'):
-            expected = obj['checksum']['value']
-            record(f"{name}: {obj['checksum']['type']}", info.checksum == expected,
-                   f"server {info.checksum}, local {expected}")
+        elif checksum:
+            record(f"{name}: {checksum['type']}", info.checksum == checksum['value'],
+                   f"server {info.checksum}, local {checksum['value']}")
+        elif expected is not None and backend.capabilities.object_checksum:
+            record(f'{name}: checksum', True, 'size only (no copy record for this replica)')
         else:
             record(f'{name}: checksum', True, 'size only (backend reports no checksum)')
         if target is not None and target.retention_days:

@@ -11,9 +11,9 @@ and the plugin never alters NetBox's schema.
 | | |
 |---|---|
 | **Backs up** | The NetBox database (`pg_dump` inside an exported snapshot), media and scripts read through Django `STORAGES`, and the configuration |
-| **Stores to** | Local disk / NFS / SMB, S3 and compatibles (AWS, MinIO, Ceph, Wasabi, Hetzner, IONOS), Azure Blob; more through the `netbox_backup.backends` entry point |
+| **Stores to** | Local disk / NFS / SMB, S3 and compatibles (AWS, MinIO, Ceph, Wasabi, Hetzner, IONOS), Azure Blob, Google Cloud Storage, SFTP, and through rclone FTPS, WebDAV, B2, Swift and more; further drivers through the `netbox_backup.backends` entry point. Replicas copy every set to further targets, server-side within a provider |
 | **Encrypts** | GnuPG, streaming: AES-256 to two recipients (an operational key and an offline recovery key), with a signed manifest. There is no unencrypted mode |
-| **Proves** | A set counts only after its checksums verify. The dump is checked row for row against the snapshot while it streams. A restore counts only after the baseline matches |
+| **Proves** | A set counts only after its checksums verify. The dump is checked row for row against the snapshot while it streams. A restore counts only after the baseline matches. A separate QA instance can restore production's sets on a schedule and sign the result |
 | **Immutability** | Bucket or container default retention in compliance mode. The worker can neither delete nor re-lock sets; pruning needs a separate credential |
 | **Schedules** | Five-field cron per policy with a time zone; GFS retention plus a minimum age |
 | **Restores** | Into a second, empty database (the restore slot) followed by a switch, or in place behind a verified safety set. Both can be rolled back |
@@ -26,7 +26,7 @@ new as the server. Scheduled backups need an RQ worker serving the plugin's queu
 
 ```bash
 source /opt/netbox/venv/bin/activate
-pip install "netbox-backup[s3]"        # or [azure], or [all]; the core install pulls no cloud SDKs
+pip install "netbox-backup[s3]"        # or [azure], [gcs], [sftp], or [all]; the core install pulls no cloud SDKs
 cd /opt/netbox/netbox
 ```
 
@@ -121,8 +121,10 @@ PYTHONPATH=/path/to/netbox-backup/testing NETBOX_CONFIGURATION=netbox_backup_tes
 ```
 
 The suite runs real `pg_dump`/`pg_restore` and `gpg` round trips against the test database, with S3 tested against
-moto. With `NBB_TEST_AZURITE=1` and Azurite on port 10000, the Azure Blob contract tests run as well. Restore tests
-create and drop a second database, so the test role needs `CREATEDB`; it does not need superuser rights.
+moto. The storage contract suite also runs SFTP against a throwaway OpenSSH `sshd` and rclone against a local
+remote when those binaries are installed; with `NBB_TEST_AZURITE=1` and Azurite on port 10000 it covers Azure Blob,
+and with `NBB_TEST_GCS_ENDPOINT` (e.g. fake-gcs-server on `http://127.0.0.1:4443`) GCS. Restore tests create and
+drop a second database, so the test role needs `CREATEDB`; it does not need superuser rights.
 
 ## License
 

@@ -56,6 +56,20 @@ def sync_static(config=None):
     return targets
 
 
+def configured_backend(target, prune=False):
+    """
+    The driver for a TargetConfig, with the checksum capability the last probe observed: where the server's
+    checksum differed from the locally computed one (SSE-KMS, SSE-C), level 1 on that target is size only.
+    """
+    from ..models import StorageTarget
+    backend = get_backend(target, prune=prune)
+    if backend.capabilities.object_checksum:
+        probe = StorageTarget.objects.filter(name=target.name).values_list('last_probe', flat=True).first()
+        if probe and probe.get('object_checksum') is None:
+            backend.capabilities = backend.capabilities._replace(object_checksum=None)
+    return backend
+
+
 def set_fields_from_header(header):
     """
     Catalog fields recoverable from a signed header alone (no key needed).
@@ -173,6 +187,9 @@ def _sync(config=None, log=None, keyring=None):
             stats['expired'] += 1
     BackupSet.objects.filter(status=SetStatusChoices.EXPIRED,
                              expired_at__lt=now - timedelta(days=EXPIRED_ROW_DAYS)).delete()
+    if config.crypto.report_signers:
+        from . import qa
+        stats['qa_reports'] = qa.import_reports(config, log=log)
     log.info(f"Catalog sync: {stats['created']} imported, {stats['updated']} updated, {stats['expired']} expired")
     return stats
 

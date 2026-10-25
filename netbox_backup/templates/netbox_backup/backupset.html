@@ -24,6 +24,7 @@
           <tr><th scope="row">{% trans "Set" %}</th><td><code>{{ object.set_id }}</code></td></tr>
           <tr><th scope="row">{% trans "Status" %}</th><td>{% badge object.get_status_display bg_color=object.get_status_color %}</td></tr>
           <tr><th scope="row">{% trans "Verified" %}</th><td>{% badge object.get_verify_level_display bg_color=object.get_verify_level_color %} {% if object.verified_at %}<small class="text-muted">{{ object.verified_at|isodatetime }}</small>{% endif %}</td></tr>
+          {% if object.qa_report %}<tr><th scope="row">{% trans "QA restore" %}</th><td>{% if object.qa_report.passed %}{% badge _("Passed") bg_color="green" %}{% else %}{% badge _("Failed") bg_color="red" %}{% endif %} <small class="text-muted">{{ object.qa_report.finished }} on {{ object.qa_report.qa_hostname|default:object.qa_report.qa_instance }}</small>{% if object.qa_report.error %}<br><small>{{ object.qa_report.error }}</small>{% endif %}</td></tr>{% endif %}
           <tr><th scope="row">{% trans "Policy" %}</th><td>{% if object.policy %}{{ object.policy|linkify }}{% else %}{{ object.policy_name|placeholder }}{% endif %}</td></tr>
           <tr><th scope="row">{% trans "Trigger" %}</th><td>{{ object.get_trigger_display }}{% if object.created_by %} ({{ object.created_by }}){% endif %}</td></tr>
           <tr><th scope="row">{% trans "Instance" %}</th><td><code>{{ object.instance_id }}</code></td></tr>

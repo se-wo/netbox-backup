@@ -34,6 +34,8 @@ checks. Only the reference string is stored in the database.
 | `verify_dump` | `True` | Feed the dump to `pg_restore` while it streams and compare its rows with the snapshot's counts |
 | `pg_dump`, `pg_restore`, `psql` | on `PATH` | Client binaries; at least the server's major version |
 | `pgbackrest` | `None` | Monitor an external pgBackRest stanza: `{'stanza': 'netbox', 'max_age': '2d'}` ([PostgreSQL DR](postgresql-dr.md)) |
+| `headroom` | `{}` | Server headroom for slot loads and drills, measured instead of `--headroom-confirmed`: `{'storage_bytes': <the server's provisioned storage>, 'max_used_percent': 80, 'ignore_databases': [...]}`. The load passes if the server's databases plus twice the live database stay below that share. A database without `CONNECT` for the NetBox role can't be measured and blocks the check unless listed in `ignore_databases` |
+| `qa` | `{}` | On a QA restore instance: `{'report_target': '<target>'}`, the target (with a credential that may write only `<instance>/reports/`) that signed QA reports go to; default: the target the set was read from |
 | `extra_configuration_files` | `[]` | Further files for the config component (e.g. LDAP CA bundles) |
 
 ## Targets
@@ -42,7 +44,7 @@ Common options:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `backend` | required | `local`, `s3`, `azure_blob`, or a name registered through the `netbox_backup.backends` entry point |
+| `backend` | required | `local`, `s3`, `azure_blob`, `gcs`, `sftp`, `rclone`, or a name registered through the `netbox_backup.backends` entry point |
 | `prefix` | `''` | Key prefix; sets live at `<prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/` |
 | `credentials` | `{}` | Secret references the worker uses |
 | `prune_credentials` | `{}` | Secret references for the maintenance runner, the only credential allowed to delete |
@@ -90,17 +92,60 @@ SDK's default caps a blob near 195 GiB. Enable **version-level immutability** wi
 container and lock it. Hierarchical-namespace accounts don't support it. Azure reports no whole-blob checksum for
 block uploads, so level 1 is size only and says so.
 
+### `gcs`
+
+| Key | Meaning |
+|---|---|
+| `bucket`, `project` | Where |
+| `credentials` | `service_account_json` (a reference to the key file's JSON), or nothing for application default credentials (workload identity, `GOOGLE_APPLICATION_CREDENTIALS`) |
+| `endpoint_url`, `anonymous` | For emulators such as fake-gcs-server |
+
+Objects are resumable uploads in 8 MiB chunks with `ifGenerationMatch=0`, so a write never replaces an object.
+GCS reports the whole-object MD5, which the writer computes locally, so level 1 compares checksums. Give the bucket
+a **retention policy** of at least `retention_days` and **lock** it (`gcloud storage buckets update --lock-retention-period`);
+`probe` requires the lock. Locking is one-way: retention can then only grow. Unfinished resumable sessions are never
+visible and expire after a week. Install with `pip install "netbox-backup[gcs]"`.
+
+### `sftp`
+
+| Key | Meaning |
+|---|---|
+| `host`, `port` (22), `path` | Where |
+| `known_host` | **Required.** The server's host key as in `known_hosts` without the host name (e.g. `ssh-ed25519 AAAA…`, from `ssh-keyscan -t ed25519 <host>`), or a list of them; `@cert-authority ssh-ed25519 AAAA…` pins a CA for host certificates. There is no trust on first use |
+| `credentials` | `username` and `key` (an OpenSSH private key) with an optional `passphrase` and `certificate`, or `password` |
+| `allow_prune` | As for `local`; or give `prune_credentials` a login that may delete |
+
+Writes go to an exclusively created `.part` file, are fsynced where the server supports it (`fsync@openssh.com`) and
+renamed with SFTP's plain rename, which OpenSSH refuses when the target exists, so writes are create-only. SFTP
+gives no immutability (use a WORM filer); level 1 is size only. This is the air-gapped option next to `local`.
+Install with `pip install "netbox-backup[sftp]"`.
+
+### `rclone`: FTPS, WebDAV, B2, Swift and more
+
+| Key | Meaning |
+|---|---|
+| `remote` | `<remote name>:<path>` from the rclone configuration, e.g. `b2:netbox-backups/prod` |
+| `binary`, `binary_sha256` | The rclone binary (default: on `PATH`) and its SHA-256, **required**: a binary with another hash is never run (`sha256sum $(which rclone)`) |
+| `credentials` | `config` (a reference to an rclone.conf; prefer one encrypted with `rclone config`) and `config_password` |
+| `flags` | Extra rclone flags, e.g. `['--transfers', '4']` |
+| `spool_dir`, `allow_prune` | Where uploads spool first (ciphertext, deleted after the upload); delete permission as for `local` |
+
+Uploads always spool to a private local file, because rclone can stream to only some remotes, and go up with
+`copyto --immutable` after a check that the key does not exist yet. Immutability is the provider's and is not
+verified; level 1 is size only. Configure remotes with certificate verification on.
+
 ## Policies
 
 | Key | Default | Meaning |
 |---|---|---|
 | `target` | the only target | Primary target |
-| `replicas` | `()` | Further targets (copying arrives in M2) |
+| `replicas` | `()` | Further targets each set is copied to after the backup (see [Replicas](backup-and-restore.md#replicas)) |
 | `components` | all four | `database`, `media`, `scripts`, `config` |
 | `schedule` | `daily` | Five-field cron, or `hourly` (`0 * * * *`), `daily` (`0 1 * * *`), `weekly` (`0 1 * * 0`) |
 | `time_zone` | `TIME_ZONE` | Time zone of the schedule and of the GFS buckets |
 | `retention` | below | GFS rules |
 | `zstd_level` | `3` | pg_dump (`--compress=zstd:N`, pg_dump 16+) and tarball compression |
+| `verify_schedule` | `None` | Five-field cron for re-running level 1 on every usable set of the policy: still present, sizes and checksums unchanged, still locked |
 | `max_runtime` | `4h` | The RQ job timeout of the backup. After it, the job refuses to write the manifest and `_COMPLETE`; the scheduler marks the set failed once the policy's lock is free and terminates the lock sessions of a hung job. Incomplete sets are collected after max(24 h, the longest `max_runtime` + 1 h) |
 | `enabled` | `True` | |
 
@@ -136,7 +181,8 @@ full media copy.
 | `signing_key` | Fingerprint of the key that signs manifests. Must be neither a recipient nor the recovery key |
 | `signing_secret_key`, `signing_passphrase` | The worker's signing key and its passphrase (references) |
 | `identities`, `identity_passphrase` | Decryption keys. Mount them **only** for restores and QA restores |
-| `trusted_signers` | Extra fingerprints accepted on verification (a rotated signing key, a QA instance's report key) |
+| `trusted_signers` | Extra fingerprints accepted on manifest verification: a rotated signing key, or on a QA instance production's signing key |
+| `report_signers` | On production: the QA instance's report key. Only these keys count for QA reports, and they never count for manifests; this install's own `signing_key` is refused here, so a compromised worker cannot vouch for its own sets |
 | `compliance` | `None` (default) or `'de-vs'` |
 | `gpg_binary` | `gpg` |
 
@@ -175,6 +221,7 @@ them has expired.
   restores with `docker compose run --rm --entrypoint "" netbox /opt/netbox/venv/bin/python manage.py nbbackup ...`
   so the entrypoint's automatic `migrate` never runs against the slot.
 * **Helm:** a plugin worker deployment, secret mounts for the `file:` references, and the maintenance runner as a
-  CronJob in its own namespace with the prune credential.
+  CronJob in its own namespace with the prune credential (and, for scheduled drills, the ops identity and a
+  `headroom` setting).
 * **Shared PaaS PostgreSQL:** the NetBox role must own its database, create its extensions (e.g. `ltree`) itself,
   and own the slot database. No superuser or server-level rights are needed.

@@ -1,9 +1,9 @@
 """
 manage.py nbbackup ...
 
-    run <policy> · pre-upgrade · list · show <set> · verify <set> [--drill] · prune [--dry-run] · slot init <db>
-    restore plan|load|finish|status|rollback|finalize|media · catalog sync · target probe <name>
-    keys generate · status [--json]
+    run <policy> · pre-upgrade · list · show <set> · verify <set> [--drill] · replicate <set> · prune [--dry-run]
+    slot init <db> · restore plan|load|finish|status|rollback|finalize|media · qa run|import · catalog sync
+    target probe <name> · keys generate · status [--json]
 
 Restore commands run from an ops shell or a one-shot container, never the web process. They skip Django system
 checks and work against an empty or unmigrated database.
@@ -76,6 +76,10 @@ class Command(BaseCommand):
         p.add_argument('--target')
         p.add_argument('--headroom-confirmed', action='store_true')
 
+        p = sub.add_parser('replicate', help="Copy a set to its policy's replicas (or the given targets)")
+        p.add_argument('set', nargs='?', default='latest')
+        p.add_argument('--target', action='append', help='Replica target; repeat for several')
+
         p = sub.add_parser('prune', help='Apply retention (deletes only with a prune credential)')
         p.add_argument('--dry-run', action='store_true')
         p.add_argument('--target', action='append')
@@ -101,6 +105,8 @@ class Command(BaseCommand):
                 q.add_argument('--confirm', metavar='DATABASE')
                 q.add_argument('--skip-safety', action='store_true')
                 q.add_argument('--revoke-resurrected', action='store_true')
+                q.add_argument('--qa', action='store_true', help='QA instance: finish --qa right after an in-place '
+                                                                  'load')
         q = restore.add_parser('finish')
         q.add_argument('restore_id', nargs='?')
         q.add_argument('--qa', action='store_true')
@@ -118,6 +124,15 @@ class Command(BaseCommand):
         q.add_argument('set', nargs='?', default='latest')
         q.add_argument('--target')
         q.add_argument('--components', nargs='+', choices=('media', 'scripts'), default=['media'])
+
+        p = sub.add_parser('qa', help='QA restore instance')
+        qa = p.add_subparsers(dest='qa_action', required=True)
+        q = qa.add_parser('run', help="Restore production's newest set in place, check it, write a signed report")
+        q.add_argument('set', nargs='?', default='latest')
+        q.add_argument('--from-instance', required=True, help="The production install's instance_id")
+        q.add_argument('--target')
+        q.add_argument('--confirm', metavar='DATABASE', help="This QA instance's database, which is replaced")
+        qa.add_parser('import', help='Production: import signed QA reports from storage')
 
         p = sub.add_parser('catalog', help='Catalog maintenance')
         catalog = p.add_subparsers(dest='catalog_action', required=True)
@@ -185,6 +200,10 @@ class Command(BaseCommand):
         from ...engine.backup import run_backup
         backup_set = run_backup(policy, trigger=trigger, created_by=self._user(), log=logger,
                                 components=options.get('components'))
+        if conf.get_config().policy(policy).replicas:
+            from ...engine.replicate import replicate
+            replicate(backup_set.set_id, log=logger)
+            backup_set.refresh_from_db()
         self.stdout.write(self.style.SUCCESS(
             f"{backup_set.set_id} {backup_set.get_status_display()} {human_size(backup_set.size_bytes)}"
         ))
@@ -256,6 +275,37 @@ class Command(BaseCommand):
             raise CommandError(f"Set {manifest.set_id} failed verification")
         self.stdout.write(self.style.SUCCESS(f"Set {manifest.set_id} passed level 1"))
 
+    def do_replicate(self, options):
+        from ...engine import catalog
+        from ...engine.replicate import replicate
+        from ...engine.restore import locate
+        from ...models import BackupSet
+        _, _, manifest = locate(conf.get_config(), options['set'])
+        if not BackupSet.objects.filter(set_id=manifest.set_id).exists():
+            catalog.sync()
+        results = replicate(manifest.set_id, targets=options.get('target'), log=logger)
+        if not results:
+            raise CommandError(f"Set {manifest.set_id}: its policy has no replicas; name one with --target")
+        for name, status in results.items():
+            style = self.style.SUCCESS if status == 'verified' else self.style.ERROR
+            self.stdout.write(style(f"{name}: {status}"))
+        if any(status != 'verified' for status in results.values()):
+            raise CommandError('Replication failed')
+
+    def do_qa(self, options):
+        if options['qa_action'] == 'import':
+            from ...engine import qa
+            if not conf.get_config().crypto.report_signers:
+                raise CommandError('crypto.report_signers is empty: name the QA instance\'s report key')
+            self.stdout.write(f"{qa.import_reports(log=logger)} set(s) updated from QA reports")
+            return
+        from ...engine.restore import Restorer
+        journal, report = Restorer(log=logger, user=self._user()).qa_run(
+            options['set'], from_instance=options['from_instance'], target=options.get('target'),
+            confirm=options.get('confirm'))
+        self.stdout.write(self.style.SUCCESS(f"QA restore {journal.restore_id} of set {report['set_id']} passed; "
+                                             f"report {report['report_id']}"))
+
     def do_prune(self, options):
         from ...engine import catalog
         from ...engine.prune import prune
@@ -315,6 +365,7 @@ class Command(BaseCommand):
                 from_instance=options.get('from_instance'), components=options.get('components'),
                 confirm=options.get('confirm'), skip_safety=options['skip_safety'],
                 headroom_confirmed=options['headroom_confirmed'], revoke_resurrected=options['revoke_resurrected'],
+                qa=options['qa'],
             )
         elif action == 'finish':
             journal = restorer.finish(options.get('restore_id'), qa=options['qa'],
@@ -381,8 +432,19 @@ class Command(BaseCommand):
         except locks.PooledConnection as e:
             failed = True
             self.stdout.write(self.style.ERROR(f"database: FAILED: {e}"))
+        from ...engine.checks import check_ownership
+        ownership = check_ownership(config)
+        for problem in ownership['problems']:
+            failed = True
+            self.stdout.write(self.style.ERROR(f"ownership: {problem}"))
+        if not ownership['problems']:
+            self.stdout.write("ownership: OK (every schema and extension belongs to the NetBox role)")
         for name in names:
             report = get_backend(config.target(name)).probe(under=config.instance_id or '')
+            if config.target(name).backend == 'local':
+                from ...engine.backup import database_volume_problem
+                problem = database_volume_problem(config.target(name))
+                report.check('not on the database volume', problem is None, problem or '')
             StorageTarget.objects.filter(name=name).update(last_probe=report.as_dict(), last_probe_at=timezone.now())
             self.stdout.write(f"{name}: {'OK' if report.ok else 'FAILED'}")
             for c in report.checks:
