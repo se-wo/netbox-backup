@@ -326,10 +326,16 @@ class NewerClientRestoreTest(EngineTestBase):
         self.assertFalse(unsupported(b"INSERT INTO t VALUES ('SET transaction_timeout = 0');\n"))
 
     def test_restore_and_test_restore_via_psql(self):
-        # lock_timeout is something every pg_restore emits, so stripping it proves the filter runs on real output
-        with mock.patch('netbox_backup.engine.pg.settings_to_strip', return_value={'lock_timeout'}), \
-                mock.patch('netbox_backup.engine.pg.restore_via_psql', wraps=__import__(
-                    'netbox_backup.engine.pg', fromlist=['restore_via_psql']).restore_via_psql) as via_psql:
+        from netbox_backup.engine import pg
+        real_strip = pg.settings_to_strip
+
+        # lock_timeout is something every pg_restore emits, so also stripping it proves the filter runs on real
+        # output. Keep whatever the real client/server combination needs stripped as well.
+        def strip(server_major, client_major):
+            return real_strip(server_major, client_major) | {'lock_timeout'}
+
+        with mock.patch.object(pg, 'settings_to_strip', side_effect=strip), \
+                mock.patch.object(pg, 'restore_via_psql', wraps=pg.restore_via_psql) as via_psql:
             backup = create_backup(kind='database', trigger='cli')
             passed, results = verify_backup(backup, level='restore')
             self.assertTrue(passed, results)
