@@ -77,7 +77,8 @@ class InPlaceRestoreTest(RestoreTestBase):
         # Rebuilt by catalog sync from the signed header alone, so the baseline (encrypted body) is not there
         self.assertEqual(safety.trigger, TriggerChoices.SAFETY)
         step_names = [s['step'] for s in journal['steps']]
-        for step in ('safety', 'empty', 'pg_restore', 'baseline', 'migrate', 'jobs', 'redis', 'sessions'):
+        for step in ('safety', 'empty', 'pg_restore', 'baseline', 'migrate', 'jobs', 'redis', 'sessions',
+                     'enqueue full backup'):
             self.assertIn(step, step_names)
 
         # Journal is in storage too, for a fresh container

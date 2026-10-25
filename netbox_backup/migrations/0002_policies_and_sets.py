@@ -12,8 +12,8 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("core", "0026_populate_job_execution_time"),
-        ("extras", "0144_customfield_status"),
+        ("core", "0019_configrevision_active"),
+        ("extras", "0133_make_cf_minmax_decimal"),
         ("netbox_backup", "0001_initial"),
     ]
 

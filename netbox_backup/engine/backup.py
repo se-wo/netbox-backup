@@ -42,7 +42,7 @@ def ensure_instance(backend, config):
         document = {
             'instance_id': config.instance_id,
             'hostname': socket.gethostname(),
-            'site_url': getattr(settings, 'BASE_PATH', '') or '',
+            'allowed_hosts': list(getattr(settings, 'ALLOWED_HOSTS', [])),
             'created': timezone.now().isoformat(),
             'plugin_version': __version__,
         }

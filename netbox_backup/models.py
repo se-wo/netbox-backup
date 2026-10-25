@@ -9,6 +9,7 @@ from django.db import models
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 from netbox.models import NetBoxModel
+from netbox.models.features import JobsMixin
 from utilities.querysets import RestrictedQuerySet
 
 from .choices import (
@@ -56,7 +57,7 @@ class StorageTarget(NetBoxModel):
         return bool(self.last_probe and self.last_probe.get('ok'))
 
 
-class BackupPolicy(NetBoxModel):
+class BackupPolicy(JobsMixin, NetBoxModel):
     name = models.CharField(verbose_name=_('name'), max_length=64, unique=True)
     components = models.JSONField(verbose_name=_('components'), default=list)
     schedule = models.CharField(verbose_name=_('schedule'), max_length=100, blank=True)

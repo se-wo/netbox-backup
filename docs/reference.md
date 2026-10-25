@@ -1,81 +1,95 @@
-# CLI and REST API Reference
+# CLI, REST API and metrics reference
 
-## CLI: `manage.py netbox_backup <action>`
+## `manage.py nbbackup`
 
-| Action | Purpose |
+| Command | Does |
 |---|---|
-| `create [--full] [--verify quick\|deep\|restore] [--no-prune]` | Take a backup now. |
-| `list [--instance ID] [--instances] [--json]` | List backups **in storage** (authoritative), or the instance IDs present. |
-| `show <backup> [--instance ID] [--json]` | Show a manifest. |
-| `verify <backup> [--level quick\|deep\|restore]` | Verify a backup (default `deep`). Exits non-zero on failure. |
-| `restore <backup> [options]` | Restore. See below. |
-| `download <backup> <dir>` | Download, verify and decrypt the artifacts into `<dir>`. |
-| `delete <backup> [--yes]` | Delete from storage and the catalog. |
-| `prune [--dry-run]` | Apply the retention policy. |
-| `sync` | Rebuild the catalog from storage. |
-| `status [--json]` | Health conditions. Exit code **0** ok/info, **1** warning, **2** error. |
-| `genkey` | Print a random encryption key. |
+| `run [<policy>] [--components ...] [--background]` | A backup now; `--background` enqueues it on the plugin queue |
+| `pre-upgrade [--policy]` | A manual set tagged for an upgrade |
+| `list [--target] [--instance] [--json]` | Sets in storage (no catalog needed) |
+| `show [<set>] [--json]` | Signed header, plus the decrypted body summary when an identity is mounted |
+| `verify [<set>]` | Level-1 check of every copy |
+| `verify [<set>] --drill [--headroom-confirmed]` | Level 2 on demand: load into the restore slot, check the baseline and migration plan, empty the slot |
+| `prune [--dry-run] [--target ...]` | Apply retention; deletes only with a prune credential |
+| `slot init <database>` | Mark an empty database owned by the NetBox role as the restore slot |
+| `restore plan [<set>] [--from-instance] [--components] [--json]` | Preflight; recommends `--slot` or `--in-place` |
+| `restore load [<set>] --slot \| --in-place --confirm <db> [--skip-safety] [--revoke-resurrected]` | Load the set |
+| `restore finish [<restore>] [--qa] [--revoke-resurrected]` | After the switch: migrate, reset runtime state, write media |
+| `restore status [<restore>] [--json]` | Journals, local and from storage |
+| `restore rollback [<restore>] [--confirm <db>]` | Switch back (slot) or reload the safety set (in place) |
+| `restore finalize [<restore>] [--force]` | Empty the old database after `rollback_days` |
+| `restore media [<set>] [--components media scripts]` | Media alone, against the live database |
+| `catalog sync` | Rebuild sets and copies from storage |
+| `target probe [<name>]` | Round trip, create-only check, default retention, lifecycle rule |
+| `keys generate --name <uid> --out <dir> [--passphrase-env VAR]` | A brainpoolP384r1 key pair, written as `<fingerprint>.pub.asc` / `.sec.asc` |
+| `status [--json] [--no-workers]` | Health; exits 0 ok, 1 warning, 2 error |
 
-`<backup>` is a full name, a unique prefix, `latest`, `latest-full` or `latest-database`.
+`<set>` is a ULID, a unique ULID prefix, or `latest` (the default).
 
-### `restore` options
+## `netbox-backup` (standalone, no Django)
 
-| Option | Effect |
+| Command | Does |
 |---|---|
-| `--dry-run` | Run preflight checks only. |
-| `--yes` | Skip the confirmation prompt (required when not on a TTY). |
-| `--components database,media,scripts,reports` | Restore a subset. |
-| `--instance ID` | Restore another instance's backup (implies `--allow-foreign-instance`). |
-| `--allow-foreign-instance` | Allow a backup whose instance ID differs from this installation's. |
-| `--allow-newer` | Allow a backup made by newer code. **Not recommended.** |
-| `--terminate-connections` | Kill other database sessions instead of refusing. |
-| `--no-safety-backup` | Skip the pre-restore safety backup. |
-| `--no-migrate` | Do not run migrations afterwards. |
-| `--extract-config DIR` | Also write the backed-up configuration files to `DIR`. |
-| `--jobs N` | Parallel `pg_restore` jobs. |
+| `list [--all-instances] [--json]` | Sets per target |
+| `verify [<set>] [--deep]` | Level 1; `--deep` downloads every object, checks SHA-384 and decrypts when an identity is configured |
+| `fetch [<set>] --out <dir>` | Ciphertext and manifest, hash-checked |
+| `decrypt [<set>] --out <dir> [--components ...]` | Verified plaintext components plus the manifest body |
+| `restore-db [<set>] --dsn <url> [--confirm <db>]` | Load the database component into a marked slot or a confirmed database, then check the baseline |
+| `check --max-age 26h` | Dead-man's check against storage: exit 0 ok, 2 too old or unreachable |
 
-## REST API: `/api/plugins/backup/`
+Global options are `--config` (a JSON file with the plugin dict, or a `configuration.py`; default
+`$NETBOX_BACKUP_CONFIG` or `/etc/netbox-backup.json`), `--target` and `--instance`. `restore-db` reads the password
+from the DSN or `PGPASSWORD`.
 
-| Method & path | Permission | Description |
+## REST API (`/api/plugins/backup/`)
+
+| Endpoint | Methods | Notes |
 |---|---|---|
-| `GET  backups/` | `view_backup` | List (filters: `kind`, `status`, `trigger`, `verification_status`, `encrypted`, `instance_id`, `started_at__after`, `started_at__before`, `q`) |
-| `GET  backups/<id>/` | `view_backup` | Detail, including `manifest` and `verification_log` |
-| `DELETE backups/<id>/` | `delete_backup` | Delete from catalog and storage |
-| `POST backups/run/` | `run_backup` | `{"kind": "database"\|"full", "verify_level": null\|"quick"\|"deep"\|"restore"}` → `202` + Job |
-| `POST backups/<id>/verify/` | `run_backup` + `view_backup` | `{"level": "deep"}` → `202` + Job |
-| `POST backups/sync/` | `run_backup` | Reconcile with storage → counts |
-| `GET  status/` | `view_backup` | `{"instance_id", "status", "conditions": [{"name", "status", "message"}]}` |
-| `GET  restores/`, `GET restores/<id>/` | `view_restoreevent` | Restore history |
+| `targets/`, `policies/` | GET | Read-only mirrors of static config |
+| `policies/{id}/run/` | POST | Manual backup; needs `netbox_backup.run_backuppolicy`. Returns 202 with the job |
+| `sets/` | GET | Filter by `policy_id`, `status`, `trigger`, `verify_level`, `target_id`, `started__after/before` |
+| `sets/{id}/download/` | POST | Off unless `allow_download`; superusers only; presigned URLs valid five minutes or less; ciphertext only |
+| `restores/` | GET | Plans and journals |
+| `status/` | GET | One JSON health summary for monitoring |
 
-Write endpoints need a write-enabled token. Poll the returned job at `/api/core/jobs/<id>/`. On completion its
-`data` holds `{"backup": name, "backup_id": id, ...}`.
+## Permissions
 
-Example: trigger a full backup with a test restore from CI before an upgrade.
+Standard view permissions per model, plus two custom actions registered through NetBox's model-action API:
+`run_backuppolicy` (manual backups) and `verify_backupset` (level-1 checks). There is no restore permission, because
+restores need infrastructure access rather than a NetBox login. Downloads are superuser-only: a set contains every
+password hash and token.
 
-```bash
-curl -sX POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-     https://netbox.example.com/api/plugins/backup/backups/run/ \
-     -d '{"kind": "full", "verify_level": "restore"}'
-```
+## Events
 
-## Health conditions
+Each `BackupJob` uses its `BackupPolicy` as the job's object and stores the set status in the job data
+(`set_id`, `status`, `size_bytes`, `warnings`, `error`). NetBox raises "Job completed" for every terminal job
+status, so an event rule on that event for *Backup policy*, with a condition on `data.status`, can send webhooks
+or notifications.
 
-| Condition | ok | warning | error |
-|---|---|---|---|
-| StorageReachable | probe write/read/delete succeeded | | storage unusable |
-| ScheduleConfigured | a schedule is enabled and its job is queued | no schedule, or no queued job (restart netbox-rq) | |
-| BackupAvailable | newest successful backup is fresh | older than `stale_after` | none exists |
-| FullBackupAvailable | a full backup exists | files are unprotected | |
-| LastBackupSucceeded | last run succeeded | completed with warnings | last run failed |
-| BackupVerified | newest backup verified (*info* if never) | | verification failed |
-| RestoreTested | some backup passed a test restore | never test-restored | |
-| Encryption | encrypted (*info* if not) | | |
-| ConfigurationProtected | configuration included | `SECRET_KEY`/peppers not backed up | |
-| StorageIsolated | no other instance in the location | other instance IDs present | |
-| PointInTimeRecovery *(optional)* | pgBackRest healthy | no WAL / stale | stanza broken |
-| RecoveryRequired *(after a restore)* | | | last restore failed or row counts mismatched |
+## Metrics
 
-## Prometheus / monitoring
+With `METRICS_ENABLED`, these gauges are computed from the catalog at scrape time (worker processes can't publish
+to the web process's `/metrics`):
 
-`netbox_backup status --json` (exit code 0/1/2) works as a Nagios/Icinga check or a node-exporter textfile
-collector. `GET /api/plugins/backup/status/` works for HTTP-based monitoring.
+| Metric | Labels |
+|---|---|
+| `netbox_backup_last_success_timestamp_seconds` | policy, target |
+| `netbox_backup_last_verified_timestamp_seconds` | policy, level |
+| `netbox_backup_scheduler_last_tick_timestamp_seconds` | |
+| `netbox_backup_enabled_policies` | |
+| `netbox_backup_duration_seconds` | policy |
+| `netbox_backup_size_bytes` | policy, component |
+| `netbox_backup_media_missing` | policy |
+| `netbox_backup_locked_offsite_copies` | policy |
+| `netbox_backup_target_up` | target |
+
+[`contrib/prometheus-alerts.yml`](../contrib/prometheus-alerts.yml) has example rules:
+* no success within interval + max_runtime + 1 h;
+* no scheduler run for 15 minutes;
+* a drop in enabled policies;
+* no locked off-site copy;
+* missing media;
+* a failed probe;
+* no QA restore in 35 days.
+
+Add `netbox-backup check --max-age 26h` to external monitoring; it catches a NetBox that is down entirely.

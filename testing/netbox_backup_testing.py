@@ -10,8 +10,9 @@ ALLOWED_HOSTS = ['*']
 DATABASES = {
     'default': {
         'NAME': os.environ.get('NETBOX_DB_NAME', 'netbox'),
-        'USER': 'netbox',
-        'PASSWORD': 'netbox',
+        # CI runs as a non-superuser role that owns its databases, as on a shared PaaS server
+        'USER': os.environ.get('NETBOX_DB_USER', 'netbox'),
+        'PASSWORD': os.environ.get('NETBOX_DB_PASSWORD', 'netbox'),
         'HOST': 'localhost',
         'PORT': '',
         'CONN_MAX_AGE': 300,

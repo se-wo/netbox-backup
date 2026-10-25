@@ -140,8 +140,29 @@ def cmd_decrypt(args, config):
     return 0
 
 
+def write_loaded_journal(config, backend, target_name, manifest, database):
+    """
+    A journal in the "loaded" state, so "manage.py nbbackup restore finish" picks the restore up once NetBox starts
+    against the database. It finishes like an in-place restore and writes the set's media and scripts.
+    """
+    now = datetime.now(UTC).isoformat()
+    restore_id = layout.new_ulid()
+    components = ['database'] + [c for c in ('media', 'scripts') if layout.OBJECT_NAMES[c] in manifest.objects]
+    journal = {
+        'restore_id': restore_id, 'set_id': manifest.set_id, 'strategy': 'in-place', 'target': target_name,
+        'instance_id': config.instance_id, 'source_instance_id': manifest.instance_id, 'status': 'loaded',
+        'components': components, 'live_database': database, 'slot_database': database, 'previous_database': None,
+        'user': os.environ.get('USER', 'netbox-backup'), 'started': now, 'updated': now, 'seq': 1, 'warnings': [],
+        'plan': {}, 'steps': [{'step': 'restore-db', 'status': 'done', 'at': now,
+                               'detail': 'loaded by the standalone CLI; baseline matches'}],
+    }
+    backend.put_bytes(f'{config.instance_id}/journal/{restore_id}/001-loaded.json',
+                      json.dumps(journal, indent=1, sort_keys=True).encode())
+    return restore_id
+
+
 def cmd_restore_db(args, config):
-    _, backend, manifest = _find(config, args.set, args.target, args.instance)
+    target_name, backend, manifest = _find(config, args.set, args.target, args.instance)
     db = pgcore.Database.from_dsn(args.dsn, pg_dump=config.pg_dump, pg_restore=config.pg_restore, psql=config.psql)
     with db.connect() as conn:
         marked = pgcore.has_slot_marker(conn, db.name)
@@ -171,8 +192,9 @@ def cmd_restore_db(args, config):
         return 2
     if missing:
         print(f"Loaded without privileges; re-apply grants for: {', '.join(missing)}", file=sys.stderr)
+    restore_id = write_loaded_journal(config, backend, target_name, manifest, db.name)
     print(f"Set {manifest.set_id} loaded into {db.name}; baseline matches. Start NetBox against {db.name} and run "
-          f"'manage.py nbbackup restore finish'.")
+          f"'manage.py nbbackup restore finish {restore_id}'.")
     return 0
 
 

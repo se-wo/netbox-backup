@@ -623,11 +623,13 @@ class Restorer:
         journal.update(media_safety=safety_copies)
         journal.step('media safety copy', detail=', '.join(safety_copies) or 'no file components')
 
+        import io
+
         from django.core.management import call_command
-        call_command('migrate', interactive=False, verbosity=0)
+        call_command('migrate', interactive=False, verbosity=0, stdout=io.StringIO())
         journal.step('migrate')
         self._reset_runtime_state(journal)
-        call_command('reindex', lazy=True, verbosity=0)
+        call_command('reindex', lazy=True, verbosity=0, stdout=io.StringIO())
         with db.connect() as conn:
             pgcore.analyze(conn)
         journal.step('reindex and analyze')

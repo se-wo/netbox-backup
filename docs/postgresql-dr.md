@@ -1,24 +1,39 @@
-# PostgreSQL Disaster Recovery
+# PostgreSQL DR and point-in-time recovery
 
-## Two layers
+Point-in-time recovery is outside the plugin's v1 scope. On a shared PaaS server, PITR comes from the provider,
+and only for NetBox: extract the NetBox database from a temporary provider clone and load it through the normal
+restore. The shared server itself is never restored. pgBackRest or WAL-G remain options for self-hosted servers;
+the plugin already monitors a pgBackRest stanza.
 
-| | Logical backups (this plugin) | Physical backups + WAL (pgBackRest) |
-|---|---|---|
-| Recovery point | the moment of each backup | **any point in time** within the WAL archive |
-| Granularity | per database | whole PostgreSQL cluster |
-| Portable across PG major versions | **yes** | no |
-| Restorable without the original server config | **yes** | needs matching PostgreSQL setup |
-| Includes media, scripts, configuration | **yes** (full backups) | no |
-| Runs where | on the NetBox host, as the NetBox DB user | on the database server, as `postgres` |
-| Verifiable by NetBox | **yes**: row counts, test restores | status only (see below) |
+## Tiers
 
-For most NetBox installs, frequent logical backups (for example `database_backup_interval: 60`) are enough. An
-hour of lost edits is the worst case, and recovery is one command.
+| Tier | RPO | Restores to | Owned by |
+|---|---|---|---|
+| Logical sets (this plugin) | the schedule interval | any PostgreSQL at or above the source major, any host or cloud | plugin |
+| pgBackRest / WAL-G | seconds (last archived WAL) | the same major, by time, LSN or immediate | the database host; the plugin monitors |
+| Provider PITR (Azure Flexible Server, RDS, Cloud SQL) | provider-defined, typically minutes | the same provider | the provider; NetBox is extracted from a clone |
 
-If you need a recovery point objective of minutes, or a rewind to just before a bad bulk edit, add pgBackRest on
-the database server **as well**. Keep the plugin's full backups for files, configuration and portability.
+Media RPO is always the set schedule: no database backup, provider PITR included, captures uploaded files.
 
-## Pairing with pgBackRest
+## Shared PaaS: a point in time without touching the shared server
+
+Until the plugin's provider-clone load (`restore load --from-dsn`, planned) exists, the procedure is:
+
+1. The platform team creates a point-in-time clone on a new, temporary server, e.g.
+   `az postgres flexible-server restore --restore-time ...`. Production is not changed. Record the clone's actual
+   recovery point, not the requested one.
+2. Make the clone reachable from an ops container (firewall rules and private endpoints are not copied).
+3. Dump only the NetBox database from the clone and load it into the restore slot:
+   `pg_dump -Fc -d "<clone DSN>/netbox" -f netbox.pitr.dump`, then `pg_restore --no-owner --exit-on-error -d
+   netbox_b netbox.pitr.dump` into the marked slot. Or take a set from it with a NetBox container whose
+   `DATABASES` point at the clone, and restore that set.
+4. Continue with the normal switch and `nbbackup restore finish`. Media for that moment comes from the nearest set.
+5. The platform team deletes the clone.
+
+The clone copies the whole shared server, every tenant's data included. That makes it a platform runbook with
+data-governance sign-off, not something the plugin triggers.
+
+## Pairing with pgBackRest (self-hosted servers)
 
 NetBox Enterprise 2.3+ runs pgBackRest for its built-in database (weekly full, daily incremental, continuous WAL
 archiving). The same setup on a community install looks like this, on the **database server**:
@@ -82,16 +97,16 @@ sudo systemctl stop postgresql
 sudo -u postgres pgbackrest --stanza=netbox --delta \
      --type=time "--target=2026-10-25 09:41:00+00" --target-action=promote restore
 sudo systemctl start postgresql
-cd /opt/netbox/netbox && python manage.py migrate && python manage.py netbox_backup sync
+cd /opt/netbox/netbox && python manage.py migrate && python manage.py nbbackup catalog sync
+sudo -u postgres pgbackrest --stanza=netbox --type=full backup     # avoid the timeline-fork error [058]
 sudo systemctl start netbox netbox-rq
 ```
 
-`netbox_backup sync` re-reads the catalog from storage afterwards, so backups taken after the recovery point
-are listed again.
+`nbbackup catalog sync` re-reads the catalog from storage afterwards, so sets taken after the recovery point are
+listed again.
 
-Before relying on a point-in-time restore, compare row counts against a logical backup from around the same
-time. `netbox_backup show <name> --json | jq .database.row_counts` gives the expected counts. A database that
-comes up cleanly is not proof the data is there.
+A database that comes up cleanly is not proof the data is there. Compare its counts with a set from around the same
+time: `nbbackup show <set>` prints the set's row total and newest `last_updated`.
 
 ## Logical restores across PostgreSQL versions
 
@@ -99,10 +114,10 @@ A logical backup restores into any PostgreSQL major version that NetBox supports
 PostgreSQL upgrades and host migrations:
 
 ```bash
-python manage.py netbox_backup create --verify deep          # on the old server
-# point DATABASES at the new, empty PostgreSQL server
-python manage.py netbox_backup restore latest
+python manage.py nbbackup run                                # on the old server
+# point DATABASES at the new, empty database on the new server
+python manage.py nbbackup restore load latest --in-place     # an empty database needs no --confirm
 ```
 
 The `pg_restore` binary must be at least as new as the `pg_dump` that made the dump, and at least the new
-server's version. Preflight checks both.
+server's version. `restore plan` checks both.

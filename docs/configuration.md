@@ -1,108 +1,160 @@
-# Configuration
+# Configuration reference
 
-All settings live under `PLUGINS_CONFIG['netbox_backup']` in `configuration.py`. Every key is optional.
+Everything lives in `PLUGINS_CONFIG['netbox_backup']` in `configuration.py`. That includes targets, policies, keys,
+secret references and restore slots. Nothing is configured in the UI, so a NetBox admin can't redirect, weaken or
+decrypt backups, and a disaster-recovery host can read the same settings before any database exists. The
+standalone `netbox-backup` CLI reads the same dict from a JSON file (or from `configuration.py`).
 
-| Setting | Default | Description |
-|---|---|---|
-| `storage` | `{'backend': 'local', 'path': '<NetBox root>/backups'}` | Where backups go. See below. |
-| `instance_id` | derived from `SECRET_KEY` | Identifies this installation inside the storage location. Letters, digits, `.`, `_`, `-`. |
-| `database_backup_interval` | `1440` | Minutes between scheduled **database** backups. `None` disables them. |
-| `full_backup_interval` | `None` | Minutes between scheduled **full** backups (database + files + configuration). |
-| `retention` | `'1 month'` | Age after which backups are pruned. Accepts `'30 days'`, `'2w'`, `'12h'`, `'1 year'`, or an int (days). `None` keeps everything. |
-| `keep_last` | `3` | Never prune the newest N successful backups of each kind. |
-| `encryption_key` | `None` | Passphrase for AES-256-GCM encryption of every artifact. Generate with `netbox_backup genkey`. |
-| `include_files` | `['media', 'scripts', 'reports']` | File trees in full backups. |
-| `include_configuration` | `'auto'` | Bundle `configuration.py` (and `ldap_config.py`) into full backups. `'auto'` means only when encrypted. |
-| `extra_configuration_files` | `[]` | Further files to bundle with the configuration (e.g. TLS certificates, SAML metadata). |
-| `verify_after_backup` | `True` | Pre-upload verification (dump TOC and archive readability). |
-| `stale_after` | 2× shortest interval | Minutes after which **BackupAvailable** turns to *warning*. |
-| `housekeeping_interval` | `60` | Minutes between catalog sync, retention pruning and scratch-DB cleanup. |
-| `work_dir` | system temp dir | Scratch space while building or restoring. Needs room for the dump plus archives. |
-| `pg_dump` / `pg_restore` | `'pg_dump'` / `'pg_restore'` | Client binaries, e.g. `'/usr/lib/postgresql/16/bin/pg_dump'`. |
-| `psql` | `'psql'` | Used only when `pg_restore` is newer than the server (see troubleshooting). |
-| `pg_dump_extra_args` | `[]` | Extra `pg_dump` arguments, e.g. `['--compress=zstd:3']` (PG 16+). |
-| `compression_level` | `6` | gzip level for file archives. |
-| `pgbackrest` | `None` | Monitor an external pgBackRest stanza: `{'stanza': 'netbox', 'max_age': '8 days', 'binary': 'pgbackrest', 'config': None}`. |
+## Secrets
 
-Changing an interval takes effect when `netbox-rq` restarts.
+Secrets are always references, never literals:
 
-## Storage backends
-
-### Local directory / mounted share
-
-```python
-'storage': {'backend': 'local', 'path': '/mnt/backup/netbox'},
-```
-
-Writes are atomic (temporary file, `fsync`, rename). Files are created with mode 0600 and directories with
-0700. The NetBox service user needs write access. A local disk only protects against data mistakes, not against
-losing the host: prefer NFS/SMB or S3.
-
-### S3-compatible
-
-```python
-'storage': {
-    'backend': 's3',
-    'bucket': 'netbox-backups',
-    'prefix': 'prod',                     # optional
-    'region_name': 'eu-central-1',
-    'endpoint_url': None,                 # e.g. 'https://minio.example.com:9000'
-    'access_key_id': '...',               # omit to use the standard AWS credential chain / instance role
-    'secret_access_key': '...',
-    'session_token': None,
-    'verify': True,                       # or a CA bundle path
-    'addressing_style': None,             # 'path' for most MinIO setups
-    'storage_class': None,                # e.g. 'STANDARD_IA'
-    'server_side_encryption': None,       # 'AES256' or 'aws:kms'
-    'sse_kms_key_id': None,
-},
-```
-
-Requires `boto3` (`pip install netbox-backup[s3]`). Minimum IAM permissions on the bucket and prefix:
-`s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`.
-
-Hardening:
-
-* Turn on **bucket versioning** with a lifecycle rule that expires noncurrent versions after N days. A
-  compromised NetBox host can then delete backups, but not permanently.
-* Better still, use **S3 Object Lock** (governance mode) with a retention at least as long as the plugin's
-  `retention`. If the plugin tries to prune a locked backup, the delete fails and is logged on the job, and the
-  backup reappears in the catalog at the next sync. That is the intended behaviour.
-
-### Custom backends
-
-`'backend': 'mypackage.storage.MyStorage'`: subclass `netbox_backup.storage.Storage` and implement `put_file`,
-`get_file`, `put_bytes`, `get_bytes`, `exists`, `size`, `list_children`, `delete_prefix`, `open_read` and
-`describe`. `netbox_backup/tests/test_storage.py::StorageContract` is a ready-made test mixin for a new backend.
-
-## Permissions
-
-NetBox object permissions on the **Backup** object type:
-
-| Action | Grants |
+| Reference | Reads |
 |---|---|
-| `view` | Backups list, detail, Status page, `GET` API |
-| `delete` | Delete backups (from storage too) |
-| `run` *(custom action)* | Run backups, verify, sync catalog, from the UI and the API |
-| `download` *(custom action)* | Download artifacts as stored (encrypted artifacts stay encrypted) |
+| `env:NAME` | the environment variable `NAME` |
+| `file:/path` | the file's contents, without the trailing newline (Docker/Kubernetes secret mounts) |
 
-Add `run` and `download` under **Additional actions** when you create the permission. **Restore** has no web
-permission: it is a CLI operation on the NetBox host.
+A literal value in a `credentials` block, or a secret-like option such as `secret_key` outside one, fails startup
+checks. Only the reference string is stored in the database.
 
-## Example: production
+## Top level
 
-```python
-PLUGINS_CONFIG = {
-    'netbox_backup': {
-        'instance_id': 'netbox-prod',
-        'storage': {'backend': 's3', 'bucket': 'acme-netbox-backups', 'prefix': 'prod',
-                    'region_name': 'eu-central-1'},          # credentials from the instance role
-        'encryption_key': os.environ['NETBOX_BACKUP_KEY'],
-        'database_backup_interval': 60,                     # hourly database backups
-        'full_backup_interval': 1440,                       # daily full backups
-        'retention': '45 days',
-        'keep_last': 7,
-        'work_dir': '/var/tmp/netbox-backup',
-    },
-}
-```
+| Key | Default | Meaning |
+|---|---|---|
+| `instance_id` | derived from `SECRET_KEY` | UUID that names this install in every key and manifest. **Pin it**: disaster recovery on an empty database needs it, and health warns until it is pinned. Generate with `uuidgen` |
+| `targets` | `{}` | Storage targets by name (below) |
+| `policies` | one `default` policy when exactly one target exists | Backup policies by name (below) |
+| `crypto` | | Keys (below). Without it no backup runs: there is no unencrypted mode |
+| `databases` | `()` | The two databases of the restore slot pair, e.g. `['netbox_a', 'netbox_b']`. One is live, the other is the slot |
+| `spool_dir` | `$TMPDIR/netbox-backup` | Local spool for restores. Use an ephemeral volume with room for about 3× the set |
+| `restore_jobs` | `4` | `pg_restore --jobs` |
+| `rollback_days` | `2` | How long `restore finalize` waits before emptying the old database |
+| `allow_download` | `False` | Enables `POST /api/plugins/backup/sets/{id}/download/` (superusers only, ciphertext only) |
+| `verify_dump` | `True` | Feed the dump to `pg_restore` while it streams and compare its rows with the snapshot's counts |
+| `pg_dump`, `pg_restore`, `psql` | on `PATH` | Client binaries; at least the server's major version |
+| `pgbackrest` | `None` | Monitor an external pgBackRest stanza: `{'stanza': 'netbox', 'max_age': '2d'}` ([PostgreSQL DR](postgresql-dr.md)) |
+| `extra_configuration_files` | `[]` | Further files for the config component (e.g. LDAP CA bundles) |
+
+## Targets
+
+Common options:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `backend` | required | `local`, `s3`, `azure_blob`, or a name registered through the `netbox_backup.backends` entry point |
+| `prefix` | `''` | Key prefix; sets live at `<prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/` |
+| `credentials` | `{}` | Secret references the worker uses |
+| `prune_credentials` | `{}` | Secret references for the maintenance runner, the only credential allowed to delete |
+| `retention_days` | `0` | The bucket's or container's default retention. `probe` checks that it is in place, in compliance mode, and locked where the provider supports locking |
+| `quota_bytes` | `None` | Health warns at 70 % of it |
+| `offsite` | `True` except for `local` | Counts toward "at least one locked off-site copy" |
+| `retention` | the policy's | Override the policy's GFS rules for sets on this target |
+
+### `local`: disk, NFS, SMB mount
+
+| Key | Meaning |
+|---|---|
+| `path` | Root directory |
+| `allow_prune` | `True` lets `nbbackup prune` delete here. Filesystems have no separate credential, so this flag stands in for one |
+
+Each write goes to an exclusively created `.part` file. It is fsynced, hard-linked to its final name (which fails if
+that name exists) and the directory is fsynced. Filesystems give no immutability; use a WORM filer for that.
+
+### `s3`
+
+| Key | Meaning |
+|---|---|
+| `bucket`, `region`, `endpoint_url` | Where; `endpoint_url` for MinIO, Ceph RGW, Wasabi, Hetzner, IONOS |
+| `credentials` | `access_key` + `secret_key` (+ `session_token`), or `profile`; empty uses the default chain (IAM role, IRSA/web identity) |
+| `checksum_mode` | `when_supported` (default) or `when_required` for stores that reject trailing checksums (`InvalidArgument`) |
+| `sse`, `kms_key_id` | `AES256` or `aws:kms`. With SSE-KMS the ETag is not an MD5, so level-1 checks fall back to size only |
+| `storage_class`, `addressing_style`, `verify`, `concurrency` | As in boto3; `concurrency` (default 2) bounds memory to part size × (concurrency + 1) |
+
+Every request carries Content-MD5. The ETag is computed locally from the part digests and stored in the manifest,
+so level 1 compares our value with the server's. Writes use `If-None-Match: *`. The bucket needs:
+
+* versioning plus object lock with a **default retention in COMPLIANCE mode** of at least `retention_days`;
+* a lifecycle rule `AbortIncompleteMultipartUpload` after **1 day**.
+
+### `azure_blob`
+
+| Key | Meaning |
+|---|---|
+| `account_url` or `account_name`, `container` | Where |
+| `credentials` | `connection_string`, `account_key`, `sas_token`, or nothing for managed/workload identity (`client_id` selects a user-assigned identity) |
+| `tier` | `Hot` (default). Cool and Cold charge early-deletion fees, which a rolling retention always incurs |
+
+Blocks carry a transactional MD5 and are committed create-only. Block size follows the size hint, because the
+SDK's default caps a blob near 195 GiB. Enable **version-level immutability** with a default policy on the
+container and lock it. Hierarchical-namespace accounts don't support it. Azure reports no whole-blob checksum for
+block uploads, so level 1 is size only and says so.
+
+## Policies
+
+| Key | Default | Meaning |
+|---|---|---|
+| `target` | the only target | Primary target |
+| `replicas` | `()` | Further targets (copying arrives in M2) |
+| `components` | all four | `database`, `media`, `scripts`, `config` |
+| `schedule` | `daily` | Five-field cron, or `hourly` (`0 * * * *`), `daily` (`0 1 * * *`), `weekly` (`0 1 * * 0`) |
+| `time_zone` | `TIME_ZONE` | Time zone of the schedule and of the GFS buckets |
+| `retention` | below | GFS rules |
+| `zstd_level` | `3` | pg_dump (`--compress=zstd:N`, pg_dump 16+) and tarball compression |
+| `max_runtime` | `4h` | Job timeout. A set still running after this is marked failed |
+| `enabled` | `True` | |
+
+The scheduler runs every 5 minutes, so schedules resolve to 5-minute slots. A run missed while the worker was down
+runs once on recovery, not once per missed slot.
+
+### Retention
+
+| Key | Default | Meaning |
+|---|---|---|
+| `keep_last` | 7 | Most recent N sets |
+| `keep_daily` | 14 | Newest set per day for N days |
+| `keep_weekly` | 8 | Newest set per ISO week |
+| `keep_monthly` | 12 | Newest set per month |
+| `keep_yearly` | 0 | Newest set per year |
+| `min_age` | `24h` | Never prune younger than this |
+| `keep_min_verified` | 1 | Once QA restores exist, always keep N sets with a passed QA restore |
+
+GFS counts only verified sets (level 1 passed), and the newest verified set is never pruned. GFS decides which sets
+*may* go; the target's default retention decides the *earliest* date they can. That is why an hourly policy should
+write database-only sets to a short-retention target: otherwise each of 24 daily sets carries a 35-day lock and a
+full media copy.
+
+## Crypto
+
+| Key | Meaning |
+|---|---|
+| `public_keys` | Reference to an armored file holding every pinned public key. Any other key in it is discarded |
+| `recipients` | Full fingerprints of the encryption recipients: the ops key and the offline recovery key |
+| `signing_key` | Fingerprint of the key that signs manifests |
+| `signing_secret_key`, `signing_passphrase` | The worker's signing key and its passphrase (references) |
+| `identities`, `identity_passphrase` | Decryption keys. Mount them **only** for restores and QA restores |
+| `trusted_signers` | Extra fingerprints accepted on verification (a rotated signing key, a QA instance's report key) |
+| `compliance` | `None` (default) or `'de-vs'` |
+| `gpg_binary` | `gpg` |
+
+The algorithm profile always admits only BSI TR-02102-1 key types: ECDSA/ECDH on brainpoolP256r1, P384r1 or
+P512r1, and RSA of 3072 bits or more. `nbbackup keys generate` creates brainpoolP384r1 keys. Encryption is AES-256,
+signatures use SHA-384, and both are checked from gpg's status output on every read.
+
+`compliance: 'de-vs'` additionally runs gpg with `--compliance=de-vs --require-compliance`. That needs a GnuPG and
+libgcrypt build whose random number generator is de-vs compliant. Stock distribution packages (Ubuntu 24.04: GnuPG
+2.4.4, libgcrypt 1.10.3) are not: they refuse every encrypt and sign in that mode with "RNG is not compliant". Use
+GnuPG VS-Desktop or a libgcrypt built with a compliant RNG before turning it on.
+
+Key rotation: new recipients apply to new sets. Keep old decryption keys in escrow until the last set encrypted to
+them has expired.
+
+## Environment-specific notes
+
+* **netbox-docker:** add the plugin and gnupg to the image along with the newest `postgresql-client` from the
+  PostgreSQL apt repository, and run a second worker container with `rqworker netbox_backup.netbox_backup`. Run
+  restores with `docker compose run --rm --entrypoint "" netbox /opt/netbox/venv/bin/python manage.py nbbackup ...`
+  so the entrypoint's automatic `migrate` never runs against the slot.
+* **Helm:** a plugin worker deployment, secret mounts for the `file:` references, and the maintenance runner as a
+  CronJob in its own namespace with the prune credential.
+* **Shared PaaS PostgreSQL:** the NetBox role must own its database, create its extensions (e.g. `ltree`) itself,
+  and own the slot database. No superuser or server-level rights are needed.

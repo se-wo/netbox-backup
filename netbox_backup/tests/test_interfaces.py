@@ -183,6 +183,11 @@ class InterfaceTest(MediaMixin, PluginConfigMixin, TransactionTestCase):
             self.assertEqual(code, 0, out)
             with psycopg.connect(password=db.password, **{**db.params, 'dbname': EXTRA_DB}) as c:
                 self.assertEqual(c.execute('SELECT count(*) FROM dcim_site').fetchone()[0], 5)
+            # restore finish picks the load up from storage
+            from netbox_backup.engine import journal as journal_mod
+            loaded = journal_mod.load(statuses=('loaded',))
+            self.assertEqual(loaded['slot_database'], EXTRA_DB)
+            self.assertIn(loaded.restore_id, out)
         finally:
             os.environ.pop('PGPASSWORD', None)
             admin.execute(f'DROP DATABASE IF EXISTS {EXTRA_DB} WITH (FORCE)')

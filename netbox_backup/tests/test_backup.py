@@ -234,6 +234,16 @@ class SchedulerTest(PluginConfigMixin, TestCase):
         self.assertEqual(BackupPolicy.objects.get().primary_target, StorageTarget.objects.get(name='primary'))
         self.assertIsNotNone(scheduler.last_tick())
 
+    def test_backup_job_enqueues_on_plugin_queue(self):
+        from core.models import Job
+
+        from netbox_backup.jobs import QUEUE, BackupJob
+        catalog.sync_static()
+        policy = BackupPolicy.objects.get()
+        job = BackupJob.enqueue(instance=policy, policy=policy.name, queue_name=QUEUE)
+        self.assertEqual(Job.objects.get(pk=job.pk).object, policy)
+        self.assertEqual(job.queue_name, QUEUE)
+
     def test_worst_case_loss_and_next_runs(self):
         policy = conf.get_config().policies['default']
         self.assertEqual(scheduler.worst_case_loss(policy), timedelta(days=1))
