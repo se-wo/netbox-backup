@@ -1,7 +1,10 @@
 """
 One contract suite, run against every backend: local directly, S3 against moto, Azure Blob against Azurite (set
-NBB_TEST_AZURITE=1 with Azurite listening on 127.0.0.1:10000).
+NBB_TEST_AZURITE=1 with Azurite listening on 127.0.0.1:10000), GCS against fake-gcs-server or another emulator
+(set NBB_TEST_GCS_ENDPOINT, e.g. http://127.0.0.1:4443), SFTP against a throwaway OpenSSH sshd, and rclone
+against a local remote.
 """
+import hashlib
 import os
 import shutil
 import tempfile
@@ -12,6 +15,8 @@ from netbox_backup.core.config import TargetConfig
 from netbox_backup.storage import ObjectExists, ObjectNotFound, get_backend
 from netbox_backup.storage.base import md5_etag
 from netbox_backup.storage.s3 import MIN_PART, part_size_for
+
+from .servers import SSHD, SSHServer
 
 AZURITE_CONNECTION_STRING = (
     'DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;'
@@ -195,6 +200,124 @@ class AzureBlobBackendTest(ContractMixin, unittest.TestCase):
             'credentials': {'connection_string': 'env:NBB_TEST_AZURE'},
         })
         return get_backend(target, prune=prune)
+
+
+@unittest.skipUnless(os.environ.get('NBB_TEST_GCS_ENDPOINT'), 'set NBB_TEST_GCS_ENDPOINT to a GCS emulator')
+class GCSBackendTest(ContractMixin, unittest.TestCase):
+
+    def setUp(self):
+        from google.auth.credentials import AnonymousCredentials
+        from google.cloud import storage
+        self.endpoint = os.environ['NBB_TEST_GCS_ENDPOINT']
+        self.bucket = f'b{os.urandom(6).hex()}'
+        client = storage.Client(project='test', credentials=AnonymousCredentials(),
+                                client_options={'api_endpoint': self.endpoint})
+        client.create_bucket(self.bucket)
+
+    def make_backend(self, prune=False):
+        target = TargetConfig.from_dict('gcs', {
+            'backend': 'gcs', 'bucket': self.bucket, 'prefix': 'prod', 'endpoint_url': self.endpoint,
+            'anonymous': True,
+        })
+        return get_backend(target, prune=prune)
+
+    def test_server_side_copy(self):
+        backend = self.make_backend()
+        backend.put_bytes('source', b'payload')
+        other = TargetConfig.from_dict('gcs2', {
+            'backend': 'gcs', 'bucket': self.bucket, 'prefix': 'replica', 'endpoint_url': self.endpoint,
+            'anonymous': True,
+        })
+        replica = get_backend(other)
+        replica.copy_from(backend, 'source', 7)
+        self.assertEqual(replica.get_bytes('source'), b'payload')
+        self.assertEqual(replica.stat('source').checksum, hashlib.md5(b'payload').hexdigest())
+
+
+@unittest.skipIf(SSHD is None, 'OpenSSH sshd not installed')
+class SFTPBackendTest(ContractMixin, unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.server = SSHServer()
+        os.environ['NBB_TEST_SFTP_USER'] = cls.server.user
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+        super().tearDownClass()
+
+    def setUp(self):
+        self.path = tempfile.mkdtemp(prefix='sftp-', dir=self.server.root)
+
+    def make_backend(self, prune=False, known_host=None):
+        target = TargetConfig.from_dict('nas', {
+            'backend': 'sftp', 'host': '127.0.0.1', 'port': self.server.port, 'path': self.path, 'prefix': 'prod',
+            'known_host': known_host or self.server.known_host,
+            'credentials': {'username': 'env:NBB_TEST_SFTP_USER', 'key': f'file:{self.server.client_key}'},
+        })
+        return get_backend(target, prune=prune)
+
+    def test_host_key_is_pinned(self):
+        from netbox_backup.storage import StorageError
+        with open(f'{self.server.client_key}.pub') as f:
+            wrong = f.read()
+        with self.assertRaisesRegex(StorageError, 'host key'):
+            self.make_backend(known_host=wrong).stat('x')
+        with self.assertRaisesRegex(StorageError, 'known_host'):
+            get_backend(TargetConfig.from_dict('nas', {'backend': 'sftp', 'host': 'h',
+                                                       'credentials': {'username': 'env:U'}}))
+
+    def test_worker_cannot_delete(self):
+        backend = self.make_backend()
+        backend.put_bytes('k', b'.')
+        self.assertEqual(len(backend.delete(['k'])), 1)
+        self.assertIsNotNone(backend.stat('k'))
+
+    def test_rename_refuses_an_existing_object(self):
+        backend = self.make_backend()
+        backend.put_bytes('race/target', b'first')
+        writer = backend.open_write('race/other')
+        writer.write(b'second')
+        writer.path = backend.path('race/target')  # another writer created the name after our existence check
+        with self.assertRaises(ObjectExists):
+            writer.commit()
+        self.assertEqual(backend.get_bytes('race/target'), b'first')
+        self.assertEqual([o.key for o in backend.list('race/')], ['race/target'])
+
+
+@unittest.skipIf(shutil.which('rclone') is None, 'rclone not installed')
+class RcloneBackendTest(ContractMixin, unittest.TestCase):
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='nbb-rclone-')
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.config = os.path.join(self.root, 'rclone.conf')
+        with open(self.config, 'w') as f:
+            f.write('[nas]\ntype = local\n')
+        with open(shutil.which('rclone'), 'rb') as f:
+            self.sha256 = hashlib.sha256(f.read()).hexdigest()
+
+    def make_backend(self, prune=False, **options):
+        target = TargetConfig.from_dict('rc', {
+            'backend': 'rclone', 'remote': f'nas:{self.root}/data', 'prefix': 'prod', 'binary_sha256': self.sha256,
+            'credentials': {'config': f'file:{self.config}'}, **options,
+        })
+        return get_backend(target, prune=prune)
+
+    def test_binary_is_pinned(self):
+        from netbox_backup.storage import StorageError
+        with self.assertRaisesRegex(StorageError, 'refusing to run'):
+            self.make_backend(binary_sha256='0' * 64).stat('x')
+        with self.assertRaisesRegex(StorageError, 'binary_sha256'):
+            self.make_backend(binary_sha256='')
+
+    def test_worker_cannot_delete(self):
+        backend = self.make_backend()
+        backend.put_bytes('k', b'.')
+        self.assertEqual(len(backend.delete(['k'])), 1)
+        self.assertIsNotNone(backend.stat('k'))
 
 
 class PartSizeTest(unittest.TestCase):

@@ -9,8 +9,9 @@ database restore never runs inside a web process.
 |---|---|---|
 | `netbox_backup` Django app | NetBox web and worker | Models, read-only UI and API, metrics collector |
 | Scheduler system job | RQ worker, every 5 minutes | Mirrors static config, evaluates cron schedules, enqueues due backups and the daily prune |
-| `BackupJob`, `VerifyJob`, `PruneJob` | queue `netbox_backup.netbox_backup` | Stream components to storage, level-1 checks, retention |
-| Maintenance runner | separate CronJob or container with the prune credential | `manage.py nbbackup prune` |
+| `BackupJob`, `ReplicateJob`, `VerifyJob`, `PruneJob` | queue `netbox_backup.netbox_backup` | Stream components to storage, copy sets to replicas, level-1 checks, retention |
+| Maintenance runner | separate CronJob or container with the prune credential | `manage.py nbbackup prune`, scheduled `verify --drill` |
+| QA instance (optional) | a separate NetBox install with its own database, media, Redis and `instance_id` | `nbbackup qa run`: scheduled QA restores of production sets, signed reports |
 | `manage.py nbbackup restore ...` | ops shell or one-shot container | Plan, load, finish after the switch |
 | `netbox-backup` | any host with Python 3.12 | List, fetch, verify, decrypt and `restore-db` without Django; `check --max-age` for monitoring |
 
@@ -69,6 +70,8 @@ the storage is empty, the set fails: the volume is probably not mounted.
 <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/config.json.enc
 <prefix>/<instance_id>/sets/<YYYY>/<MM>/<set_id>/_COMPLETE
 <prefix>/<source instance_id>/journal/<restore_id>/<NNN>-<step>.json
+<prefix>/<instance_id>/reports/<report_id>-<set_id>.json      # signed QA restore reports
+<prefix>/<instance_id>/audit/<event_id>-download.json          # one per download
 <prefix>/<instance_id>/.probe/<timestamp>-<id>
 ```
 
@@ -108,6 +111,27 @@ below the instance the restored set came from; each step is a new create-only ob
    written; the worker never sets or extends locks.
 7. **Level 1:** compare each object's size and checksum with what the backend reports, and check the signature
    and the lock status. The set is `verified` only if all of it passes.
+8. Enqueue `ReplicateJob` when the policy has replicas, then a prune.
+
+## Replicas
+
+A policy writes to one primary target; `ReplicateJob` then copies each set to every target in its `replicas`:
+the objects first, then `manifest.json`, then `_COMPLETE`, so a half-copied set is invisible on the replica just as
+on the primary. Within one provider the copy is **server-side** (S3 to S3 on the same endpoint with `UploadPartCopy`,
+GCS to GCS with a rewrite); across providers, or when the replica's credential cannot read the source, the objects
+**stream** through the worker. Writes on the replica are create-only like every other write.
+
+Every copied object is read once and its SHA-384 checked against the signed manifest before the copy counts: a
+streamed object before it is committed, a server-side copy right after it was made. That read also yields what
+level 1 compares on the replica. A server-side copy has its own part layout, so its S3 ETag is not the primary's:
+the copy job computes the whole-object MD5 and the part MD5s for the part size it used, and records them (with the
+part size) in the copy's catalog row. Replica copies are then verified at level 1 like the primary, after every copy
+and on each `verify_schedule`.
+
+Each copy has its own status in the copy matrix. While a replica copy failed, the set is **partial** and health
+warns; the scheduler retries a failed copy an hour after the last attempt, up to three attempts, and
+`nbbackup replicate <set>` retries by hand. The primary does not prune a set until every replica holds it. A
+replica target applies its own retention (a `retention` block on the target) and default lock.
 
 ## Crypto
 
@@ -139,7 +163,47 @@ already ships Kyber, so a later move means new keys, not new code.
 | Level | What runs | Where | When |
 |---|---|---|---|
 | 1 Integrity | sizes and checksums against the backend, signature, `_COMPLETE` hash, lock status ("size only" where the backend reports no usable checksum: Azure, SSE-KMS, SSE-C) | the worker, no private key | after every backup; `nbbackup verify <set>`; the UI's Verify button |
-| 2 QA restore | decrypt, hash check, full load into the slot, baseline check, migration plan | `nbbackup verify <set> --drill` in the restore slot | on demand (a separate QA instance follows in M2) |
+| 2 QA restore | decrypt, hash check, full restore, baseline check, `migrate --check`, API smoke test | a separate QA instance (`nbbackup qa run`), signed report | monthly, after every production NetBox or plugin upgrade, and quarterly with the offline recovery key only |
+| 2 Drill | decrypt, hash check, full load into the slot, baseline check, migration plan, archive listings | `nbbackup verify <set> --drill` in the restore slot | on demand, or scheduled on the maintenance runner |
+
+A set is trusted only at the level it was last verified, and the UI shows that level. `verify_schedule` on a policy
+re-runs level 1 on all of its sets, so an object deleted, replaced or unlocked behind the plugin's back shows up.
+
+### QA restore instance
+
+A QA instance is a separate NetBox install, e.g. `netbox-qa`, with its own database, media storage and Redis, on the
+same or a newer NetBox version (which makes it an upgrade rehearsal), and **its own pinned `instance_id`**, so it
+never writes below production's path and can't make dead production backups look healthy. A CronJob on QA runs
+
+```
+manage.py nbbackup qa run --from-instance <production instance_id> --confirm <QA database>
+```
+
+That is `restore load --in-place` of production's newest set (without a safety set: QA's data is disposable),
+followed by `restore finish --qa`: the same finish as everywhere, then `migrate --check` and an API smoke test, and
+no post-restore backup. The result, passed or failed, becomes a report signed with **QA's own key** (QA's
+`crypto.signing_key`; production's signing key goes in QA's `trusted_signers`, so QA can verify production's
+manifests). It is written create-only to `<prefix>/<production instance_id>/reports/` with a credential that can
+write only there (`qa.report_target`).
+
+Production lists QA's key in `crypto.report_signers` and imports the reports hourly and on every catalog sync
+(`nbbackup qa import` by hand). Only reports by a report signer count, and never one signed by production's own key:
+a compromised production worker could sign forged sets, but cannot vouch for them. A passed report marks the set
+level 2 (`qa_passed_at`, and `recovery_drill_at` when the recovery key alone decrypted it), feeds `keep_min_verified`
+and the level-2 metric; a failed report turns health red until a later QA restore passes.
+
+The restored data is used as it is: event rules, webhooks and data sources come back exactly as in production, so
+QA must have no network path to production systems, and it holds a full copy of production data plus the ops key.
+Protect it like production. Mount the ops identity only into the QA restore job.
+
+### Scheduled drills
+
+Without a QA instance, `nbbackup verify --drill` runs the same check on demand in the restore slot of production's
+own server. Scheduled from the maintenance runner, a drill must not pass `--headroom-confirmed`: configure
+`headroom` instead ([configuration](configuration.md#top-level)), and every drill measures the server first. It
+loads the slot only if the server's databases plus twice the live database stay below `max_used_percent` of
+`storage_bytes`, because Azure Flexible Server turns read-only server-wide at 95 % used.
+
 
 ## Restores
 
@@ -204,9 +268,9 @@ reads storage directly and never touches the catalog, so it also works on a fres
 | PostgreSQL | the server major is older than the set's, or pg_restore is older than the pg_dump that wrote it | abort |
 | Slot | missing marker, other sessions, not owned by the NetBox role, or an unfinalized rollback copy | abort, printing the command needed |
 | Ownership | an archive schema exists in the target but isn't the role's, or a foreign-owned extension would survive emptying | abort before anything is deleted |
-| Locks | the relations involved exceed half the server's lock capacity | abort |
+| Locks | the relations involved exceed half the server's lock capacity, or other roles hold locks on the role's relations | abort, naming the roles holding locks |
 | Redis | tasks and cache share one Redis database | warn; only RQ keys and the config cache keys are deleted |
-| Space | the local spool is too small, or server headroom is not confirmed (`--headroom-confirmed`) | abort; Azure Flexible Server turns read-only server-wide at 95 % used |
+| Space | the local spool is too small; for slot loads and drills, server headroom is neither confirmed (`--headroom-confirmed`) nor measured within the `headroom` threshold | abort; Azure Flexible Server turns read-only server-wide at 95 % used |
 | Instance | the set belongs to another `instance_id`, or this install's `instance_id` is not pinned | requires `--from-instance <id>` (`nbbackup list --all-instances`); QA restores and `restore-db` need a pinned ID |
 | Grantees | roles the dump grants to don't exist on this server | warn; loaded without privileges, the dropped GRANT/REVOKE/ALTER DEFAULT PRIVILEGES lines are kept in the journal (`dropped_grants`) |
 | Peppers | restored v2 tokens reference pepper IDs missing from `API_TOKEN_PEPPERS` | warn: those tokens stop validating |
@@ -302,10 +366,16 @@ due:
 * **Immutability:** bucket or container default retention in compliance mode. Health is green only if a verified,
   locked off-site copy exists.
 * **Insider:** all configuration is static, so a NetBox admin can't redirect, weaken or decrypt backups. Downloads
-  are off by default, superuser-only, presigned for at most five minutes, and ciphertext only.
+  are off by default, superuser-only, presigned for at most five minutes, and ciphertext only. Every download is
+  recorded in storage (`<instance_id>/audit/`) before the URLs are handed out; without that record there is no
+  download.
 * **Restore:** CLI only, which requires infrastructure access. Four-eyes approval is left to the organisation's
   change process. There is no restore permission in NetBox.
 * **Subprocesses:** database passwords reach pg_dump and pg_restore through a 0600 `.pgpass` in a private tmpfs
-  directory, never argv or the environment.
+  directory, never argv or the environment. The rclone binary runs only with its pinned SHA-256; SFTP connects only
+  to the pinned host key.
+* **Ownership:** a schema or extension in the live database or the slot that the NetBox role doesn't own makes
+  every restore abort at preflight. `slot init`, `target probe` and a daily scheduler run check for it, and health
+  turns red long before a restore needs it.
 * **Startup:** health refuses known sample secrets such as netbox-docker's default `SECRET_KEY` and pepper, and a
   backup refuses to run with them.

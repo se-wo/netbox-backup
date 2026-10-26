@@ -28,7 +28,7 @@ SCHEDULE_PRESETS = {
 # and only as references.
 SECRET_OPTION_NAMES = {
     'access_key', 'secret_key', 'session_token', 'account_key', 'sas_token', 'connection_string', 'password',
-    'client_secret', 'key', 'service_account_json',
+    'client_secret', 'key', 'service_account_json', 'passphrase', 'config_password',
 }
 
 _UNITS = {
@@ -260,8 +260,12 @@ class CryptoConfig:
     signing_passphrase: str | None = None
     identities: tuple = ()
     identity_passphrase: str | None = None
-    # Extra fingerprints accepted when verifying (e.g. a QA instance's report key, or a rotated signing key)
+    # Extra fingerprints accepted when verifying manifests (e.g. a rotated signing key, or on a QA instance the
+    # production signing key)
     trusted_signers: tuple = ()
+    # Keys that may sign QA restore reports (the QA instance's own key); they are never accepted for manifests, and
+    # this install's own signing key is never accepted for reports
+    report_signers: tuple = ()
 
     @classmethod
     def from_dict(cls, data):
@@ -282,6 +286,10 @@ class CryptoConfig:
         recipients = tuple(_fingerprint(f, 'crypto.recipients') for f in data.get('recipients') or ())
         signing_key = _fingerprint(data['signing_key'], 'crypto.signing_key') if data.get('signing_key') else None
         recovery_key = _fingerprint(data['recovery_key'], 'crypto.recovery_key') if data.get('recovery_key') else None
+        report_signers = tuple(_fingerprint(f, 'crypto.report_signers') for f in data.get('report_signers') or ())
+        if signing_key and signing_key in report_signers:
+            raise ConfigError("crypto.report_signers must not contain this install's own signing_key: QA reports "
+                              "count only when another instance signed them")
         if signing_key and (signing_key in recipients or signing_key == recovery_key):
             raise ConfigError("crypto.signing_key must not also be a recipient: the always-on worker holds its secret "
                               "key, so it would decrypt every set")
@@ -292,6 +300,7 @@ class CryptoConfig:
             signing_passphrase=data.get('signing_passphrase'), identities=identities,
             identity_passphrase=data.get('identity_passphrase'),
             trusted_signers=tuple(_fingerprint(f, 'crypto.trusted_signers') for f in data.get('trusted_signers') or ()),
+            report_signers=report_signers,
         )
 
     @property
@@ -331,6 +340,8 @@ class Config:
     verify_dump: bool = True
     direct_connection: dict = field(default_factory=dict)
     pgbackrest: dict | None = None
+    qa: dict = field(default_factory=dict)
+    headroom: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict, compare=False, repr=False)
 
     @classmethod
@@ -372,10 +383,15 @@ class Config:
         if bad:
             raise ConfigError(f"direct_connection accepts host, port, hostaddr, sslmode and sslrootcert, not "
                               f"{', '.join(bad)}")
+        qa = dict(data.get('qa') or {})
+        bad = sorted(set(qa) - {'report_target'})
+        if bad:
+            raise ConfigError(f"qa accepts report_target, not {', '.join(bad)}")
+        headroom = _headroom(data.get('headroom'))
         restore_jobs = data.get('restore_jobs', 4)
         if type(restore_jobs) is not int or restore_jobs < 1:
             raise ConfigError("restore_jobs must be a positive integer")
-        return cls(
+        config = cls(
             instance_id=instance_id, instance_id_pinned=pinned, targets=targets, policies=policies,
             crypto=CryptoConfig.from_dict(data.get('crypto')), databases=databases,
             spool_dir=data.get('spool_dir'), pg_dump=data.get('pg_dump') or 'pg_dump',
@@ -383,8 +399,11 @@ class Config:
             restore_jobs=restore_jobs, rollback_days=int(data.get('rollback_days', 2)),
             allow_download=bool(data.get('allow_download', False)), verify_dump=bool(data.get('verify_dump', True)),
             direct_connection=direct,
-            pgbackrest=data.get('pgbackrest'), raw=data,
+            pgbackrest=data.get('pgbackrest'), qa=qa, headroom=headroom, raw=data,
         )
+        if qa.get('report_target') and qa['report_target'] not in config.targets:
+            raise ConfigError(f"qa.report_target {qa['report_target']!r} is not a configured target")
+        return config
 
     def target(self, name):
         try:
@@ -397,6 +416,29 @@ class Config:
             return self.policies[name]
         except KeyError:
             raise ConfigError(f"Unknown policy {name!r}") from None
+
+
+def _headroom(value):
+    """
+    Server headroom for slot loads and drills: the server's provisioned storage and the share of it that may be in
+    use once the slot is loaded. With it, a drill measures instead of needing --headroom-confirmed.
+    """
+    data = dict(value or {})
+    if not data:
+        return {}
+    bad = sorted(set(data) - {'storage_bytes', 'max_used_percent', 'ignore_databases'})
+    if bad:
+        raise ConfigError(f"headroom accepts storage_bytes, max_used_percent and ignore_databases, not "
+                          f"{', '.join(bad)}")
+    storage = data.get('storage_bytes')
+    if type(storage) is not int or storage <= 0:
+        raise ConfigError("headroom.storage_bytes must be the server's provisioned storage in bytes")
+    percent = data.get('max_used_percent', 80)
+    if not isinstance(percent, (int, float)) or not 0 < percent < 95:
+        raise ConfigError("headroom.max_used_percent must be between 0 and 95 (Azure Flexible Server turns "
+                          "read-only at 95)")
+    return {'storage_bytes': storage, 'max_used_percent': percent,
+            'ignore_databases': tuple(data.get('ignore_databases') or ())}
 
 
 def _check_name(name, kind):

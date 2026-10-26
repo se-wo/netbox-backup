@@ -56,7 +56,7 @@ class BackupCopySerializer(BaseModelSerializer):
     class Meta:
         model = BackupCopy
         fields = ('id', 'display', 'target', 'status', 'is_primary', 'uploaded', 'verified', 'verify_level',
-                  'checksum_mode', 'locked_until', 'error')
+                  'checksum_mode', 'locked_until', 'copied_objects', 'attempts', 'last_attempt', 'error')
         brief_fields = ('id', 'display', 'target', 'status')
 
 
@@ -73,8 +73,8 @@ class BackupSetSerializer(BaseModelSerializer):
         fields = (
             'id', 'url', 'display_url', 'display', 'set_id', 'instance_id', 'policy', 'policy_name', 'status',
             'trigger', 'created_by', 'started', 'finished', 'netbox_version', 'size_bytes', 'manifest_sha384',
-            'components', 'baseline', 'warnings', 'error', 'verify_level', 'verified_at', 'qa_passed_at', 'copies',
-            'job',
+            'components', 'baseline', 'warnings', 'error', 'verify_level', 'verified_at', 'qa_passed_at',
+            'recovery_drill_at', 'qa_report', 'copies', 'job',
         )
         brief_fields = ('id', 'url', 'display', 'set_id', 'status')
 

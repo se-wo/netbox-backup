@@ -53,6 +53,9 @@ class TargetReport:
 def can_prune(target):
     if target.backend == 'local':
         return bool(target.options.get('allow_prune'))
+    if target.backend in ('sftp', 'rclone'):
+        # No server-side separation of rights to rely on: a separate login, or an explicit opt-in
+        return bool(target.prune_credentials or target.options.get('allow_prune'))
     return bool(target.prune_credentials)
 
 
@@ -118,10 +121,13 @@ def prune_target(config, target, dry_run=False, log=None, now=None):
         if locked:
             report.locked[listing.set_id] = max(locked).isoformat()
             continue
-        if row and row.copies.filter(is_primary=False).exclude(
+        policy = config.policies.get(row.policy_name) if row else None
+        on_primary = bool(policy and policy.target == target.name)
+        if listing.complete and on_primary and row.copies.filter(is_primary=False).exclude(
                 status__in=(CopyStatusChoices.UPLOADED, CopyStatusChoices.VERIFIED,
                             CopyStatusChoices.DELETED)).exists():
-            # The primary does not prune a set until all its required replicas hold it
+            # The primary does not prune a set until all its required replicas hold it (an incomplete set never
+            # reached them)
             report.waiting_for_replicas.append(listing.set_id)
             continue
         report.delete.append(listing.set_id)

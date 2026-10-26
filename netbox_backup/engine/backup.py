@@ -22,7 +22,7 @@ from ..choices import CopyStatusChoices, SetStatusChoices, TriggerChoices, Verif
 from ..core import layout, manifest, pipeline, sets
 from ..core import pg as pgcore
 from ..core.gpg import Keyring
-from ..storage import ObjectExists, get_backend
+from ..storage import ObjectExists
 from . import catalog, components
 from .locks import advisory_lock, assert_held
 
@@ -92,12 +92,45 @@ def ensure_instance(backend, config):
     return instance_id
 
 
-def preflight(config):
+def database_volume_problem(target):
+    """
+    Why a local target's path must not be used, or None: a backup on the database's own volume is lost with it.
+    Detectable only for a database on this host whose data_directory the role may read (superuser or
+    pg_read_all_settings); otherwise this check passes silently.
+    """
+    import os
+    path = target.options.get('path')
+    db = conf.database()
+    host = db.params.get('host')
+    if not path or (host and not host.startswith('/') and host not in ('localhost', '127.0.0.1', '::1')):
+        return None
+    try:
+        with db.connect() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT setting FROM pg_settings WHERE name = 'data_directory'")
+            row = cursor.fetchone()
+    except Exception:
+        return None
+    data_dir = row[0] if row else None
+    if not data_dir or not os.path.exists(data_dir):
+        return None
+    existing = os.path.abspath(path)
+    while not os.path.exists(existing):
+        existing = os.path.dirname(existing)
+    if os.stat(existing).st_dev == os.stat(data_dir).st_dev:
+        return f"{path} is on the same filesystem as the PostgreSQL data directory {data_dir}"
+    return None
+
+
+def preflight(config, target=None):
     problems = conf.startup_problems()
     if problems:
         raise BackupError('; '.join(problems))
     if not config.crypto.configured:
         raise BackupError("crypto is not configured: there is no unencrypted mode (see docs/configuration.md)")
+    if target is not None and target.backend == 'local':
+        problem = database_volume_problem(target)
+        if problem:
+            raise BackupError(f"Target {target.name}: {problem}; a backup there is lost with the database")
 
 
 class BackupRunner:
@@ -122,7 +155,7 @@ class BackupRunner:
 
     def run(self):
         from ..models import BackupCopy, BackupPolicy, BackupSet
-        preflight(self.config)
+        preflight(self.config, self.target)
         targets = catalog.sync_static(self.config)
         policy_row = BackupPolicy.objects.get(name=self.policy.name)
         set_id = layout.new_ulid()
@@ -133,6 +166,10 @@ class BackupRunner:
         )
         copy = BackupCopy.objects.create(set=backup_set, target=targets[self.target.name], is_primary=True,
                                          status=CopyStatusChoices.UPLOADING)
+        # Replica copies exist from the start, so prune holds the set on the primary until every replica has it
+        for replica in self.policy.replicas:
+            BackupCopy.objects.create(set=backup_set, target=targets[replica], is_primary=False,
+                                      status=CopyStatusChoices.PENDING)
         self.set = backup_set
         self._job_data()
         db = conf.database()
@@ -143,11 +180,7 @@ class BackupRunner:
                         f"Database {db.name} carries the restore slot marker: this NetBox points at a slot that "
                         f"was never finished. Refusing to back up possibly stale data."
                     )
-                backend = get_backend(self.target)
-                probe = targets[self.target.name].last_probe
-                if probe and probe.get('object_checksum') is None and backend.capabilities.object_checksum:
-                    # The last probe saw the server's checksum differ from ours (SSE-KMS, SSE-C): size only
-                    backend.capabilities = backend.capabilities._replace(object_checksum=None)
+                backend = catalog.configured_backend(self.target)
                 instance_id = ensure_instance(backend, self.config)
                 self.config = dataclasses.replace(self.config, instance_id=instance_id)
                 if backup_set.instance_id != instance_id:
@@ -193,6 +226,8 @@ class BackupRunner:
             copy.status = CopyStatusChoices.FAILED
             copy.error = backup_set.error
             copy.save()
+            backup_set.copies.filter(is_primary=False).update(status=CopyStatusChoices.FAILED,
+                                                              error='the backup itself failed')
             self._job_data()
             self.log.error(f"Set {set_id} failed: {backup_set.error}")
             raise

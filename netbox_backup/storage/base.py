@@ -181,6 +181,14 @@ class StorageBackend:
     def abort_incomplete(self, older_than: timedelta) -> int:
         raise NotImplementedError
 
+    def copy_from(self, source: 'StorageBackend', key: str, size: int) -> dict:
+        """
+        Server-side copy of key from source (same provider) to the same key here, create-only. Returns
+        {'part_size': n or None}, the part size the copy used where the server's checksum depends on it. Raises
+        NotImplementedError where the replica job has to stream instead.
+        """
+        raise NotImplementedError
+
     def probe(self, under: str = '') -> ProbeReport:
         """
         under names the install's own area (its instance_id), so probe objects stay below it. On immutable

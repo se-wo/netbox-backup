@@ -10,7 +10,7 @@ from datetime import timedelta
 from django.utils import timezone
 
 from .. import conf
-from ..choices import SetStatusChoices, VerifyLevelChoices
+from ..choices import CopyStatusChoices, SetStatusChoices, VerifyLevelChoices
 from . import pgbackrest, scheduler
 
 OK, INFO, WARNING, ERROR = 'ok', 'info', 'warning', 'error'
@@ -118,6 +118,27 @@ def conditions(now=None, check_workers=True):
             result.append(Condition('LastRun', WARNING, f"last run {last_failed.set_id} failed: "
                                                         f"{last_failed.error[:200]}", name))
 
+    for name, policy in config.policies.items():
+        if not policy.enabled or not policy.replicas:
+            continue
+        newest = BackupSet.objects.filter(policy_name=name, instance_id=config.instance_id,
+                                          status__in=SetStatusChoices.USABLE).order_by('-finished').first()
+        if newest is None:
+            continue
+        waiting = timedelta(hours=1) + policy.max_runtime
+        for copy in newest.copies.filter(is_primary=False).select_related('target'):
+            if copy.status == CopyStatusChoices.FAILED:
+                result.append(Condition('Replica', WARNING, f"set {newest.set_id} has no copy on {copy.target.name}: "
+                                                            f"{copy.error[:200]}", name))
+            elif copy.status != CopyStatusChoices.VERIFIED and newest.finished and now - newest.finished > waiting:
+                result.append(Condition('Replica', WARNING, f"set {newest.set_id} is still not copied to "
+                                                            f"{copy.target.name} ({copy.status})", name))
+
+    from .checks import last_ownership_check
+    ownership = last_ownership_check()
+    for problem in (ownership or {}).get('problems', []):
+        result.append(Condition('Ownership', ERROR, problem))
+
     locked_offsite = BackupCopy.objects.filter(
         target__offsite=True, set__instance_id=config.instance_id, locked_until__gt=now,
         verify_level__gte=VerifyLevelChoices.INTEGRITY,
@@ -128,6 +149,13 @@ def conditions(now=None, check_workers=True):
         result.append(Condition('LockedOffsiteCopy', ERROR, 'no verified copy on an off-site target is under a '
                                                             'retention lock'))
 
+    failed_qa = BackupSet.objects.filter(instance_id=config.instance_id, qa_report__passed=False).order_by(
+        '-set_id').first()
+    if failed_qa is not None and not BackupSet.objects.filter(
+            instance_id=config.instance_id, qa_passed_at__gt=failed_qa.qa_report.get('finished') or now).exists():
+        result.append(Condition('QARestore', ERROR, f"the QA restore of {failed_qa.set_id} failed on "
+                                                    f"{failed_qa.qa_report.get('qa_instance', 'the QA instance')}: "
+                                                    f"{(failed_qa.qa_report.get('error') or '')[:200]}"))
     qa_sets = BackupSet.objects.filter(instance_id=config.instance_id, qa_passed_at__isnull=False)
     if qa_sets.exists():
         newest_qa = qa_sets.order_by('-qa_passed_at').first()

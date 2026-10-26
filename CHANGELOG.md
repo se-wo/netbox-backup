@@ -2,6 +2,39 @@
 
 ## 0.2.0 (unreleased)
 
+### M2: backends and drills
+
+* Storage drivers `gcs` (resumable uploads with `ifGenerationMatch=0`, MD5 level-1 checks, locked bucket retention
+  required by probe), `sftp` (asyncssh, pinned host key, exclusive `.part` file and create-only rename) and `rclone`
+  (binary pinned by SHA-256, referenced and optionally encrypted rclone.conf, spool then `copyto --immutable`);
+  extras `[gcs]` and `[sftp]`
+* Replicas: `ReplicateJob` copies each set to the policy's `replicas` after the backup, objects first and
+  `_COMPLETE` last; server-side within a provider (S3 `UploadPartCopy`, GCS rewrite), streaming otherwise. Every
+  copied object is read back against the manifest's SHA-384, and the copy job records the whole-object MD5 and the
+  part MD5s for its part size, so level 1 compares real checksums on the replica too. Per-copy status, `partial`
+  sets, retries by the scheduler (three attempts, an hour apart) and `nbbackup replicate`; migration 0004
+* QA restore instances: `nbbackup qa run` (in-place load of production's set, `finish --qa` with `migrate --check`
+  and an API smoke test, no post-restore backup), reports signed with the QA instance's own key below
+  `<production instance>/reports/`, imported by production against `crypto.report_signers` (never its own key);
+  a pass marks the set level 2, a failure turns health red. `restore load --in-place --qa` now finishes as a QA
+  restore (before, an in-place load always ran a normal finish)
+* Scheduled drills: `headroom` (`storage_bytes`, `max_used_percent`) lets `verify --drill` and slot plans measure
+  the server instead of needing `--headroom-confirmed`
+
+### Gaps from M1 closed
+
+* The ownership check (schemas and extensions not owned by the NetBox role) also runs in `target probe` and daily
+  in the scheduler, with a health condition
+* Preflight `Locks` also aborts when other roles hold locks on the role's relations, and names them
+* A `local` target on the PostgreSQL data directory's filesystem is refused (where the data directory is visible)
+* `verify_schedule` re-runs level 1 on every usable set of the policy
+* Downloads are recorded in storage (`<instance>/audit/`) before the URLs are handed out
+* Crash tests (a kill after every backup upload and every load and finish step, then a rerun) and guard tests
+  (drills and finalize refuse unmarked databases and other sessions; an in-place load stops when its safety set
+  does not verify, and a kill mid-load is recoverable with rollback)
+
+### M1
+
 Rebuilt to the implementation spec (M1). Not backward compatible with 0.1.0: configuration, storage layout, models
 and commands changed. Migration 0002 replaces the 0.1.0 tables.
 

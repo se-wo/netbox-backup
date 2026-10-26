@@ -1,5 +1,5 @@
 """
-Five models. Targets and policies are read-only mirrors of static config; sets, copies and restore runs are a
+Six models. Targets and policies are read-only mirrors of static config; sets, copies and restore runs are a
 catalog of what storage holds. Storage is the source of truth: "nbbackup catalog sync" rebuilds the catalog from
 manifests.
 """
@@ -144,6 +144,8 @@ class BackupSet(models.Model):
         help_text=_('A drill that decrypted the set with the offline recovery key'),
     )
     expired_at = models.DateTimeField(verbose_name=_('expired'), null=True, blank=True)
+    # The newest signed QA restore report for this set, as imported from <instance>/reports/
+    qa_report = models.JSONField(verbose_name=_('QA report'), null=True, blank=True)
     job = models.ForeignKey(
         to='core.Job', on_delete=models.SET_NULL, related_name='+', null=True, blank=True, editable=False,
     )
@@ -200,6 +202,10 @@ class BackupCopy(models.Model):
     checksum_mode = models.CharField(verbose_name=_('checksum'), max_length=20, blank=True)
     locked_until = models.DateTimeField(verbose_name=_('locked until'), null=True, blank=True)
     error = models.TextField(verbose_name=_('error'), blank=True)
+    # Replicas: per object the checksum the copy job computed for this target, and how it was copied
+    copied_objects = models.JSONField(verbose_name=_('copied objects'), default=dict, blank=True)
+    attempts = models.PositiveSmallIntegerField(verbose_name=_('attempts'), default=0)
+    last_attempt = models.DateTimeField(verbose_name=_('last attempt'), null=True, blank=True)
 
     objects = RestrictedQuerySet.as_manager()
 

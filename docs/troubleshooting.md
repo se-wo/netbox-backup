@@ -21,7 +21,7 @@
 | Set listed as incompatible | Set from a newer NetBox, or a plugin missing | Upgrade NetBox or install the plugin version `restore plan` shows |
 | `restore load` stops at the baseline check | Dump and counts disagree, or the load was incomplete | Re-run load; inspect the slot before it is emptied again |
 | `restore plan` rejects the slot | Slot missing, unmarked or not owned by the NetBox role | `nbbackup slot init <db>`, or the platform team runs `ALTER DATABASE ... OWNER TO netbox` |
-| `server headroom not confirmed` | Slot loads double NetBox's footprint on the server | Check free space (Azure Flexible Server turns read-only server-wide at 95 %), then pass `--headroom-confirmed` |
+| `server headroom not confirmed` | Slot loads double NetBox's footprint on the server | Check free space (Azure Flexible Server turns read-only server-wide at 95 %), then pass `--headroom-confirmed`; for scheduled drills configure `headroom` so the server is measured |
 | `holds the rollback copy of restore ...` | The slot still holds the previous database | `nbbackup restore finalize` once the rollback window has passed |
 | API tokens fail after restore | Pepper IDs missing from `API_TOKEN_PEPPERS` | Restore the original peppers (they are in the set's config component), or reissue tokens |
 | Scheduling not active | No worker on the plugin queue | Run `manage.py rqworker netbox_backup.netbox_backup` |
@@ -29,3 +29,9 @@
 | Probe: `default retention (compliance mode)` fails | Object lock missing, governance mode, or shorter than `retention_days` | Enable object lock with a COMPLIANCE default retention of at least `retention_days` |
 | Prune deletes nothing | The target has no prune credential, or the sets are still locked | Run `nbbackup prune` on the maintenance runner with `prune_credentials`; locked sets wait for their retention |
 | Backup refuses: `carries the restore slot marker` | NetBox points at a slot that was never finished | Finish the restore, or switch back and run `restore rollback` |
+| `host key does not match the pinned known_host` | The SFTP server's host key changed, or `known_host` holds another key | Compare with `ssh-keyscan -t ed25519 <host>` on a trusted network and update `known_host` |
+| `... has SHA-256 ..., not the pinned ...: refusing to run it` | The rclone binary was upgraded or replaced | Check the new binary, then set `binary_sha256` to `sha256sum $(which rclone)` |
+| Set shown as **partial** | A replica copy failed (see the copy's error in the set's copy table) | Fix the replica target; the scheduler retries an hour later (three attempts), or run `nbbackup replicate <set>` |
+| `QA report ... ignored: Signed by ..., which is not a pinned signer` | The report key of the QA instance is not in production's `crypto.report_signers` (or it was signed with production's own key) | Add the QA instance's report key to `report_signers` and its public key to `public_keys` |
+| `Space: server usage cannot be measured` | `headroom` is set but the NetBox role lacks `CONNECT` on another database on the server | List that database in `headroom.ignore_databases` if its size is negligible, or ask for `CONNECT` |
+| `Ownership: ... owned by another role` in health | A schema or extension (often `ltree`) was created by the server admin | Drop it and let the NetBox role create it; otherwise every restore aborts at preflight |

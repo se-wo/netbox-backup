@@ -1,4 +1,7 @@
+import json
+
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from netbox.api.viewsets import NetBoxReadOnlyModelViewSet
 from rest_framework import status
@@ -71,6 +74,16 @@ class BackupSetViewSet(NetBoxReadOnlyModelViewSet):
             except (sets.SetError, StorageError):
                 continue
             names = [layout.MANIFEST, layout.COMPLETE, *listing.objects]
+            # Audit trail outside the database a restore would replace; no record, no download
+            event = {'event': 'download', 'set_id': backup_set.set_id, 'target': copy.target.name,
+                     'user': request.user.username, 'at': timezone.now().isoformat(), 'objects': names,
+                     'remote_addr': request.META.get('REMOTE_ADDR')}
+            try:
+                backend.put_bytes(layout.audit_key(backup_set.instance_id, layout.new_ulid(), 'download'),
+                                  json.dumps(event, indent=1).encode())
+            except StorageError as e:
+                return Response({'detail': f'The download could not be recorded in storage: {e}'},
+                                status=status.HTTP_503_SERVICE_UNAVAILABLE)
             urls = {n: backend.presign(layout.object_key(backup_set.instance_id, backup_set.set_id, n))
                     for n in names}
             return Response({'target': copy.target.name, 'expires_in': 300, 'urls': urls})

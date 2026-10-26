@@ -125,7 +125,10 @@ class InPlaceRestoreTest(RestoreTestBase):
         self.assertEqual(Site.objects.count(), 20)
 
 
-class SlotRestoreTest(RestoreTestBase):
+class SlotTestBase(RestoreTestBase):
+    """
+    A second database owned by the NetBox role, configured as the restore slot (not yet marked).
+    """
 
     def setUp(self):
         super().setUp()
@@ -147,6 +150,9 @@ class SlotRestoreTest(RestoreTestBase):
         connection.close()
         settings.DATABASES['default']['NAME'] = name
         connection.settings_dict['NAME'] = name
+
+
+class SlotRestoreTest(SlotTestBase):
 
     def test_slot_init_guards(self):
         with self.assertRaisesRegex(RestoreError, 'live database'):

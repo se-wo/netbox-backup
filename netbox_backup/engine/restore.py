@@ -194,7 +194,7 @@ def dr_state(config, live=None):
 
 def _live_state(db):
     """
-    (is empty, newest last_updated, owned relations) of a database; None values when unreachable.
+    (is empty, newest last_updated, owned relations, lock capacity) of a database; None values when unreachable.
     """
     try:
         with db.connect() as conn, conn.cursor() as cursor:
@@ -206,6 +206,14 @@ def _live_state(db):
             return empty, newest, owned, capacity
     except Exception:
         return None, None, None, None
+
+
+def _foreign_lock_holders(db):
+    try:
+        with db.connect() as conn, conn.cursor() as cursor:
+            return pgcore.foreign_lock_holders(cursor)
+    except Exception:
+        return []
 
 
 def build_plan(set_ref='latest', target=None, from_instance=None, components=None, headroom_confirmed=False,
@@ -365,8 +373,13 @@ def _plan_strategy(plan, config, headroom_confirmed):
     _check_ownership(plan, target_db)
     if owned is not None and capacity:
         relations = owned + len((plan.body or {}).get('baseline', {}).get('tables', {})) * 3
-        plan.check('Locks', ABORT if relations > capacity / 2 else OK,
-                   f"~{relations} relations against a lock capacity of {capacity}")
+        blockers = _foreign_lock_holders(target_db)
+        if blockers:
+            plan.check('Locks', ABORT, f"role(s) {', '.join(blockers)} hold locks on {target_db.name}'s relations; "
+                                       f"emptying it would wait for them (ask them to disconnect)")
+        else:
+            plan.check('Locks', ABORT if relations > capacity / 2 else OK,
+                       f"~{relations} relations against a lock capacity of {capacity}")
     _check_redis(plan)
     _check_space(plan, headroom_confirmed)
     try:
@@ -462,14 +475,40 @@ def _check_space(plan, headroom_confirmed):
     needed = int(plan.size_bytes * 3)
     if plan.strategy == RestoreStrategyChoices.IN_PLACE and not plan.reason.startswith('the live database is empty'):
         needed += _safety_size_estimate()  # the local copy of the safety set stays until finalize
+    headroom = conf.get_config().headroom
     if free < needed:
         plan.check('Space', ABORT, f"spool {conf.spool_dir()} has {free} bytes free, needs about {needed}")
+    elif plan.strategy == RestoreStrategyChoices.SLOT and not headroom_confirmed and headroom:
+        ok, detail = server_headroom(headroom)
+        plan.check('Space', OK if ok else ABORT, f"spool has {free} bytes free; {detail}")
     elif plan.strategy == RestoreStrategyChoices.SLOT and not headroom_confirmed:
         plan.check('Space', ABORT, "server headroom not confirmed: loading the slot roughly doubles NetBox's "
                                    "footprint, and Azure Flexible Server turns read-only server-wide at 95% used. "
-                                   "Pass --headroom-confirmed once checked")
+                                   "Configure 'headroom' or pass --headroom-confirmed once checked")
     else:
         plan.check('Space', OK, f"spool has {free} bytes free")
+
+
+def server_headroom(headroom):
+    """
+    (ok, detail): whether loading the slot keeps the server below headroom['max_used_percent'] of its storage.
+    The load is assumed to need twice the live database (the copy plus the WAL it writes).
+    """
+    try:
+        with conf.database().connect() as conn, conn.cursor() as cursor:
+            used, unknown = pgcore.server_usage(cursor, ignore=headroom['ignore_databases'])
+            cursor.execute('SELECT pg_database_size(current_database())')
+            live = cursor.fetchone()[0]
+    except Exception as e:
+        return False, f"server usage cannot be measured: {e}"
+    if unknown:
+        return False, (f"server usage cannot be measured: no CONNECT privilege on {', '.join(unknown)} (list them "
+                       f"in headroom.ignore_databases if their size is known to be negligible)")
+    projected = used + 2 * live
+    limit = headroom['storage_bytes'] * headroom['max_used_percent'] / 100
+    detail = (f"server: {used} bytes in use, ~{projected} after the load, limit {int(limit)} "
+              f"({headroom['max_used_percent']}% of {headroom['storage_bytes']})")
+    return projected <= limit, detail
 
 
 def _human(delta):
@@ -532,9 +571,19 @@ class Restorer:
         return Keyring(self.config.crypto, identities=True)
 
     def load(self, set_ref='latest', strategy=None, target=None, from_instance=None, components=None,
-             confirm=None, skip_safety=False, headroom_confirmed=False, revoke_resurrected=False):
+             confirm=None, skip_safety=False, headroom_confirmed=False, revoke_resurrected=False, qa=False):
+        """
+        qa=True (QA instances, in place only): finish runs as "finish --qa" right after the load.
+        """
         if strategy not in (RestoreStrategyChoices.SLOT, RestoreStrategyChoices.IN_PLACE):
             raise RestoreError("load needs --slot or --in-place")
+        if qa:
+            self._check_qa_instance(from_instance)
+            if not from_instance:
+                raise RestoreError("A QA restore restores production's set: pass --from-instance <production "
+                                   "instance_id>")
+            if strategy != RestoreStrategyChoices.IN_PLACE:
+                raise RestoreError("A QA restore loads in place: the QA instance replaces its own database")
         connection.close()
         with self._keyring() as keyring:
             plan = build_plan(set_ref, target=target, from_instance=from_instance, components=components,
@@ -542,7 +591,7 @@ class Restorer:
             for c in plan.checks:
                 (self.log.error if c['result'] == ABORT else self.log.warning if c['result'] == WARN
                  else self.log.info)(f"[{c['result'].upper()}] {c['check']}: {c['detail']}")
-            if plan.strategy != strategy:
+            if plan.strategy != strategy and not qa:
                 raise RestoreError(f"plan recommends {plan.strategy} ({plan.reason}); rerun plan or pass the matching "
                                    f"flag")
             if not plan.ok:
@@ -563,7 +612,7 @@ class Restorer:
                 components=plan.components, plan=plan.as_dict(), user=self.user, live_database=plan.live_database,
                 slot_database=plan.slot_database if strategy == RestoreStrategyChoices.SLOT else plan.live_database,
                 previous_database=plan.live_database if strategy == RestoreStrategyChoices.SLOT else None,
-                run_migrations=plan.run_migrations, revoke_resurrected=revoke_resurrected,
+                run_migrations=plan.run_migrations, revoke_resurrected=revoke_resurrected, qa=qa,
             )
             journal.update(status='loading')
             journal.save_identities(keyring, identity_snapshot(conf.database()))
@@ -589,8 +638,9 @@ class Restorer:
         if in_place:
             self._safety(journal, keyring, skip_safety)
 
-        paths = sets.fetch_and_decrypt(backend, keyring, manifest, plan.components, spool)
-        journal.update(spool=spool, files={k: v for k, v in paths.items() if k != 'database'})
+        keys_used = {}
+        paths = sets.fetch_and_decrypt(backend, keyring, manifest, plan.components, spool, keys_used=keys_used)
+        journal.update(spool=spool, files={k: v for k, v in paths.items() if k != 'database'}, keys_used=keys_used)
         journal.step('fetch', detail=f"{len(paths)} component(s) verified and decrypted")
 
         if 'database' in plan.components:
@@ -600,7 +650,7 @@ class Restorer:
         journal.update(status='loaded')
         journal.step('loaded')
         if in_place:
-            return self.finish(journal=journal)
+            return self.finish(journal=journal, qa=bool(journal.get('qa')))
         self.log.info(
             f"Set {plan.set_id} is loaded into {journal['slot_database']}. Now stop NetBox web and all workers, point "
             f"DATABASES['default']['NAME'] (DB_NAME in netbox-docker) at {journal['slot_database']}, start one ops "
@@ -692,9 +742,8 @@ class Restorer:
         journal = journal or journal_mod.load(restore_id, statuses=('loaded', 'finishing'))
         if journal is None:
             raise RestoreError("No loaded restore to finish (see: nbbackup restore status)")
-        if qa and not self.config.instance_id_pinned:
-            raise RestoreError("A QA instance needs its own pinned instance_id; otherwise it would write below "
-                               "production's")
+        if qa:
+            self._check_qa_instance(journal.get('source_instance_id'))
         live = live_database_name()
         slot = journal['strategy'] == RestoreStrategyChoices.SLOT
         connection.close()
@@ -749,6 +798,9 @@ class Restorer:
                 journal.step(f'restore {component}', detail=f"{result['written']} written, "
                                                             f"{result['quarantined']} quarantined")
 
+        if qa:
+            self._qa_checks(journal)
+
         revoke = journal.get('revoke_resurrected') if revoke_resurrected is None else revoke_resurrected
         with self._keyring() as keyring:
             before = journal.load_identities(keyring)
@@ -777,6 +829,73 @@ class Restorer:
         self.log.info(f"Restore {journal.restore_id} finished. Start web and workers. Rollback is possible until "
                       f"{journal['rollback_until']}; then run: nbbackup restore finalize {journal.restore_id}")
         return journal
+
+    def _check_qa_instance(self, source_instance):
+        if not self.config.instance_id_pinned:
+            raise RestoreError("A QA instance needs its own pinned instance_id; otherwise it would write below "
+                               "production's")
+        if source_instance and source_instance == self.config.instance_id:
+            raise RestoreError("A QA restore restores another instance's set: pass --from-instance <production "
+                               "instance_id>; the QA instance has its own instance_id")
+
+    def _qa_checks(self, journal):
+        """
+        Level 2 beyond the load's baseline check: no migration left to apply, and the API answers.
+        """
+        import io
+
+        from django.core.management import call_command
+
+        from . import qa as qa_mod
+        checks = [{'check': 'baseline', 'ok': any(s['step'] == 'baseline' for s in journal['steps']),
+                   'detail': next((s.get('detail', '') for s in journal['steps'] if s['step'] == 'baseline'), '')}]
+        try:
+            call_command('migrate', check=True, plan=True, interactive=False, stdout=io.StringIO())
+            checks.append({'check': 'migrate --check', 'ok': True, 'detail': 'no unapplied migration'})
+        except SystemExit:
+            checks.append({'check': 'migrate --check', 'ok': False, 'detail': 'unapplied migrations remain'})
+        api = qa_mod.api_smoke_test()
+        checks.append({'check': 'API smoke test', 'ok': all(r['status'] == 200 for r in api),
+                       'detail': ', '.join(f"{r['path']} {r['status']}" for r in api)})
+        journal.update(qa_checks=checks)
+        journal.step('qa checks', status='done' if all(c['ok'] for c in checks) else 'failed',
+                     detail='; '.join(f"{c['check']}: {'ok' if c['ok'] else 'FAILED'}" for c in checks))
+        failed = [c for c in checks if not c['ok']]
+        if failed:
+            raise RestoreError('QA checks failed: ' + '; '.join(f"{c['check']}: {c['detail']}" for c in failed))
+
+    def qa_run(self, set_ref='latest', from_instance=None, target=None, confirm=None):
+        """
+        One scheduled QA restore: load production's set in place, finish --qa, and write a signed report of the
+        outcome, passed or failed, below the production instance.
+        """
+        from . import qa as qa_mod
+        self._check_qa_instance(from_instance)
+        if not from_instance:
+            raise RestoreError("qa run needs --from-instance <production instance_id>")
+        started = timezone.now()
+        target_name, _, manifest = locate(self.config, set_ref, target=target, from_instance=from_instance)
+        journal, error = None, ''
+        try:
+            journal = self.load(manifest.set_id, strategy=RestoreStrategyChoices.IN_PLACE, target=target_name,
+                                from_instance=from_instance, confirm=confirm, skip_safety=True, qa=True)
+        except Exception as e:
+            error = f'{type(e).__name__}: {e}'
+            journal = journal_mod.load(statuses=('failed', 'loading', 'loaded', 'finishing'))
+            if journal is not None and journal['set_id'] != manifest.set_id:
+                journal = None
+        checks = (journal.get('qa_checks') if journal else None) or []
+        report = qa_mod.build_report(
+            self.config, manifest.set_id, from_instance, started, passed=not error, checks=checks,
+            keys_used=(journal.get('keys_used') if journal else None), error=error,
+            restore_id=journal.restore_id if journal else None,
+        )
+        where = qa_mod.store_report(self.config, report, target_name)
+        self.log.info(f"QA report {report['report_id']} ({'passed' if report['passed'] else 'FAILED'}) written to "
+                      f"{where[0]}: {where[1]}")
+        if error:
+            raise RestoreError(f"QA restore of {manifest.set_id} failed: {error}")
+        return journal, report
 
     def _file_components(self, journal, spool):
         """
@@ -1031,7 +1150,11 @@ class Restorer:
             plan = build_plan(set_ref, target=target, headroom_confirmed=headroom_confirmed, keyring=keyring)
             plan.slot_database = slot
             if plan.strategy != RestoreStrategyChoices.SLOT:
+                # A drill always loads the slot: check it and the server headroom as a slot load would
+                plan.strategy = RestoreStrategyChoices.SLOT
+                plan.checks = [c for c in plan.checks if c['check'] != 'Space']
                 _check_slot(plan, self.config, report=True)
+                _check_space(plan, headroom_confirmed)
             aborts = plan.aborts
             if aborts:
                 raise RestoreError('Drill preflight failed: ' + '; '.join(f"{c['check']}: {c['detail']}"

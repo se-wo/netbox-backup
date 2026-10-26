@@ -255,6 +255,40 @@ class S3Backend(StorageBackend):
     def open_write(self, key, size_hint=None):
         return S3Writer(self, key, size_hint)
 
+    def copy_from(self, source, key, size):
+        """
+        Server-side copy from another bucket on the same endpoint: a multipart upload of UploadPartCopy ranges,
+        completed create-only. Returns the part size, from which the new ETag follows. The replica's credential
+        needs read access to the source bucket; without it the caller streams instead.
+        """
+        if not isinstance(source, S3Backend) or size == 0 \
+                or source.options.get('endpoint_url') != self.options.get('endpoint_url'):
+            raise NotImplementedError
+        part_size = part_size_for(size)
+        full_key = self.full_key(key)
+        upload_id = self.call(self.client.create_multipart_upload, Bucket=self.bucket, Key=full_key,
+                              **self.put_args())['UploadId']
+        try:
+            parts, offset = [], 0
+            while offset < size:
+                end = min(offset + part_size, size) - 1
+                response = self.call(
+                    self.client.upload_part_copy, Bucket=self.bucket, Key=full_key, UploadId=upload_id,
+                    PartNumber=len(parts) + 1, CopySource={'Bucket': source.bucket, 'Key': source.full_key(key)},
+                    CopySourceRange=f'bytes={offset}-{end}',
+                )
+                parts.append({'ETag': response['CopyPartResult']['ETag'], 'PartNumber': len(parts) + 1})
+                offset = end + 1
+            self.call(self.client.complete_multipart_upload, Bucket=self.bucket, Key=full_key, UploadId=upload_id,
+                      MultipartUpload={'Parts': parts}, IfNoneMatch='*')
+        except BaseException:
+            try:
+                self.client.abort_multipart_upload(Bucket=self.bucket, Key=full_key, UploadId=upload_id)
+            except Exception:
+                pass  # The bucket's lifecycle rule reclaims it after a day
+            raise
+        return {'part_size': part_size}
+
     def presign(self, key, expires=300):
         """
         A presigned GET URL for one object (ciphertext), valid for at most five minutes.
