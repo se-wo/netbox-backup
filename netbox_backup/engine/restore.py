@@ -152,7 +152,7 @@ def migration_state(applied):
     return unknown, pending, {k.split('.', 1)[0] for k in known}
 
 
-UNFINISHED = ('planned', 'loading', 'loaded', 'finishing', 'failed')
+UNFINISHED = journal_mod.UNFINISHED
 
 
 def unfinished_journals(database):
@@ -1039,6 +1039,13 @@ class Restorer:
                     journal.step(f'restore {component}', detail=f"{result['written']} written from the safety copy")
         if journal['strategy'] == RestoreStrategyChoices.IN_PLACE:
             self._reset_runtime_state(journal)
+        # The database rolled back to has an older catalog too: it lacks the sets taken since, and the reloaded
+        # safety set's own row still says "running"
+        from . import catalog
+        try:
+            catalog.sync(log=self.log)
+        except Exception as e:
+            journal.warn(f"catalog sync failed: {e}")
         journal.update(status='rolled-back')
         journal.step('rolled back')
         return journal

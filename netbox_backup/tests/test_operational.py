@@ -153,12 +153,83 @@ class SkippedRunTest(PluginConfigMixin, TestCase):
         with mock.patch('netbox_backup.jobs.BackupJob.enqueue'), mock.patch('netbox_backup.jobs.PruneJob.enqueue'):
             scheduler.tick(now=t0)
             row = BackupPolicy.objects.get()
-            Job.objects.create(object_type=ContentType.objects.get_for_model(BackupPolicy), object_id=row.pk,
-                               name='Backup', status='running', job_id=uuid.uuid4())
+            # Started an hour before the slot: well within max_runtime, so it may really still be running
+            job = Job.objects.create(object_type=ContentType.objects.get_for_model(BackupPolicy), object_id=row.pk,
+                                     name='Backup', status='running', job_id=uuid.uuid4(),
+                                     started=t0 + timedelta(hours=23))
             scheduler.tick(now=t0 + timedelta(days=1))
         skipped = BackupSet.objects.get()
         self.assertEqual(skipped.status, SetStatusChoices.FAILED)
         self.assertIn('Skipped', skipped.error)
+        job.refresh_from_db()
+        self.assertEqual(job.status, 'running')
+
+
+class StaleJobTest(PluginConfigMixin, TransactionTestCase):
+    """
+    A worker killed hard (OOM, pod eviction, SIGKILL after a rollout's grace period) never tells NetBox, so its
+    job stays "running" for good. That used to make the scheduler skip every later slot of the policy.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from datetime import UTC, datetime
+        self.configure(policies={'nightly': {'schedule': 'daily', 'time_zone': 'UTC', 'components': ['database']}})
+        self.t0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+        with mock.patch('netbox_backup.jobs.PruneJob.enqueue'):
+            scheduler.tick(now=self.t0)
+        self.row = BackupPolicy.objects.get()
+
+    def job(self, status, **fields):
+        from core.models import Job
+        return Job.objects.create(object_type=ContentType.objects.get_for_model(BackupPolicy), object_id=self.row.pk,
+                                  name='Backup', status=status, job_id=uuid.uuid4(), **fields)
+
+    def tick(self, days):
+        with mock.patch('netbox_backup.jobs.BackupJob.enqueue') as enqueue, \
+                mock.patch('netbox_backup.jobs.PruneJob.enqueue'):
+            scheduler.tick(now=self.t0 + timedelta(days=days))
+        return enqueue.call_count
+
+    def test_killed_worker_does_not_block_the_schedule(self):
+        job = self.job('running', started=self.t0 + timedelta(hours=13))
+        running = BackupSet.objects.create(
+            set_id=layout.new_ulid(), instance_id=conf.instance_id(), policy=self.row, policy_name=self.row.name,
+            status=SetStatusChoices.RUNNING, trigger=TriggerChoices.SCHEDULED, started=self.t0 + timedelta(hours=13),
+        )
+        self.assertEqual(self.tick(days=1), 1, 'the next slot must run')
+        job.refresh_from_db()
+        self.assertEqual(job.status, 'errored')
+        self.assertIn('worker was killed', job.error)
+        self.assertIsNotNone(job.completed)
+        running.refresh_from_db()
+        self.assertEqual(running.status, SetStatusChoices.FAILED)
+        self.assertFalse(BackupSet.objects.filter(error__startswith='Skipped').exists())
+        self.assertEqual(self.tick(days=2), 1, 'and so must every slot after it')
+
+    def test_job_that_holds_the_policy_lock_is_left_alone(self):
+        job = self.job('running', started=self.t0 + timedelta(hours=13))
+        with locks.advisory_lock('policy:nightly'):
+            self.assertEqual(self.tick(days=1), 0)
+        job.refresh_from_db()
+        self.assertEqual(job.status, 'running')
+        self.assertTrue(BackupSet.objects.filter(error__startswith='Skipped').exists())
+
+    def test_queued_job_unknown_to_rq_is_ended(self):
+        from django.utils import timezone as tz
+
+        from netbox_backup.jobs import BackupJob
+        known = BackupJob.enqueue(instance=self.row, policy='nightly', queue_name=scheduler.QUEUE, job_timeout=60)
+        self.assertEqual(scheduler.fail_stale_jobs(self.row, conf.get_config().policy('nightly'),
+                                                   now=tz.now() + timedelta(hours=1)), 0, 'RQ has this job')
+        known.delete()
+        lost = self.job('pending')
+        policy = conf.get_config().policy('nightly')
+        self.assertEqual(scheduler.fail_stale_jobs(self.row, policy), 0, 'just created: RQ may not have it yet')
+        self.assertEqual(scheduler.fail_stale_jobs(self.row, policy, now=tz.now() + timedelta(hours=1)), 1)
+        lost.refresh_from_db()
+        self.assertEqual(lost.status, 'errored')
+        self.assertIn('unknown to RQ', lost.error)
 
 
 class ServerSideEncryptionTest(PluginConfigMixin, TransactionTestCase):

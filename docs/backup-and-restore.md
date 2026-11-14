@@ -77,7 +77,9 @@ the storage is empty, the set fails: the volume is probably not mounted.
 
 `set_id` is a ULID, so keys sort by time on every backend. A set becomes visible only when `_COMPLETE` is written,
 after everything else, so no backend needs atomic multi-object writes. A signed manifest with a matching
-`_COMPLETE` is authoritative: catalog sync adopts it even if the database recorded that set as failed. Journals live
+`_COMPLETE` is authoritative: catalog sync adopts it even if the database recorded that set as failed, and checks
+every copy it finds unverified at level 1, so a set the database does not know yet (after a restore, on a rebuilt
+host) counts toward retention like any other. Journals live
 below the instance the restored set came from; each step is a new create-only object with the next free `NNN`.
 
 ### Manifest
@@ -353,6 +355,11 @@ due:
   lock expires;
 * while a policy's newest `keep_last` sets are all unverified (e.g. after a bucket switched to SSE-KMS and level 1
   failed), none of its sets is deleted and prune reports the policy as held;
+* the sets a restore still needs are kept whatever retention says: its safety set (rollback reloads it) and the set
+  it loaded (a rerun loads it again). They are released when the restore is rolled back or finalized, or when its
+  rollback window (`rollback_days`) has closed; an unfinished or failed restore keeps them until then. Prune lists
+  them as "kept for restore ...". Restores another install ran from this install's sets (a QA instance, a staging
+  copy) keep nothing here;
 * probe objects (`target probe` writes them below `<instance_id>/.probe/`) older than a day go once their lock
   expires;
 * `--dry-run` shows the diff first, which matters after a retention change, since it applies to all sets.

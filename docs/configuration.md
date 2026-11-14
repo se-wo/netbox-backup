@@ -153,6 +153,12 @@ The scheduler runs every 5 minutes, so schedules resolve to 5-minute slots. A ru
 runs once on recovery, not once per missed slot. A slot whose previous run is still queued or running is recorded as
 a failed set ("Skipped: ..."), so health and alerts see it.
 
+A worker that is killed hard (OOM, pod eviction, `SIGKILL` after a rollout's grace period) leaves its job listed as
+running in NetBox. Before a due slot the scheduler ends such a job as errored: one running for longer than
+`max_runtime` + 10 minutes while nothing holds the policy's lock, or one queued for more than 10 minutes that RQ no
+longer knows (a flushed Redis). The slot then runs. Until `max_runtime` + 10 minutes have passed the job could still
+be alive, so slots in between are skipped.
+
 ### Retention
 
 | Key | Default | Meaning |

@@ -176,6 +176,7 @@ def write_loaded_journal(config, backend, target_name, manifest, database, previ
     journal = {
         'restore_id': restore_id, 'set_id': manifest.set_id, 'strategy': 'slot' if previous else 'in-place',
         'target': target_name, 'instance_id': config.instance_id, 'source_instance_id': manifest.instance_id,
+        'restored_by': config.instance_id,
         'status': 'loaded', 'components': components, 'live_database': previous or database,
         'slot_database': database, 'previous_database': previous,
         'user': os.environ.get('USER', 'netbox-backup'), 'started': now, 'updated': now, 'seq': 1, 'warnings': [],

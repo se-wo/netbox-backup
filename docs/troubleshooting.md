@@ -25,6 +25,8 @@
 | `holds the rollback copy of restore ...` | The slot still holds the previous database | `nbbackup restore finalize` once the rollback window has passed |
 | API tokens fail after restore | Pepper IDs missing from `API_TOKEN_PEPPERS` | Restore the original peppers (they are in the set's config component), or reissue tokens |
 | Scheduling not active | No worker on the plugin queue | Run `manage.py rqworker netbox_backup.netbox_backup` |
+| Sets fail with `Skipped: the previous run of this policy was still queued or running` | The previous backup really is still running, or its worker was killed and NetBox still lists the job as running | Nothing if it is still running. A dead job is ended by the scheduler once it is older than `max_runtime` + 10 minutes (the *Backup scheduler* job logs "ended stale backup job"); to run sooner, delete the job under **Operations → Jobs** |
+| Prune keeps a set that retention no longer covers ("kept for restore ...") | A restore that used the set is unfinished, or its rollback window is still open | Finish or roll back the restore, then `nbbackup restore finalize`; the set is released at the next prune |
 | Probe: `lifecycle aborts incomplete uploads` fails | No `AbortIncompleteMultipartUpload` rule | Add one with 1 day to the bucket |
 | Probe: `default retention (compliance mode)` fails | Object lock missing, governance mode, or shorter than `retention_days` | Enable object lock with a COMPLIANCE default retention of at least `retention_days` |
 | Prune deletes nothing | The target has no prune credential, or the sets are still locked | Run `nbbackup prune` on the maintenance runner with `prune_credentials`; locked sets wait for their retention |

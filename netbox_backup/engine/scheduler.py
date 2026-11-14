@@ -94,6 +94,65 @@ def fail_overruns(now=None, log=None):
     return failed
 
 
+def _rq_job_exists(job):
+    """
+    Whether RQ still knows the job (queued, started or in a registry). None if Redis can't be asked.
+    """
+    try:
+        import django_rq
+        from rq.job import Job as RQJob
+        return bool(RQJob.exists(str(job.job_id), connection=django_rq.get_connection(QUEUE)))
+    except Exception:
+        return None
+
+
+def fail_stale_jobs(row, policy, now=None, log=None):
+    """
+    Backup jobs of a policy that NetBox still lists as queued or running although nothing will ever run them:
+
+    * running past max_runtime + 10 minutes with the policy's lock free. RQ stops a job at max_runtime, and a job
+      that is alive holds the lock, so the worker died without telling NetBox (OOM kill, pod eviction, SIGKILL
+      after a rollout's grace period);
+    * queued for more than 10 minutes while RQ has no such job (Redis was flushed or lost its data).
+
+    NetBox never ends such a job on its own, and while it is listed every scheduled slot of the policy is skipped.
+    Each is ended as errored, which raises NetBox's job events like any other failed backup. Returns the number
+    ended.
+    """
+    from core.choices import JobStatusChoices
+
+    from ..jobs import BackupJob
+    from .locks import is_locked
+    log = log or logger
+    now = now or timezone.now()
+    grace = timedelta(minutes=10)
+    lock_free = None
+    ended = 0
+    for job in BackupJob.get_jobs(row).filter(status__in=JobStatusChoices.ENQUEUED_STATE_CHOICES):
+        if job.status == JobStatusChoices.STATUS_RUNNING:
+            since = job.started or job.created
+            if not since or now - since <= policy.max_runtime + grace:
+                continue
+            if lock_free is None:
+                try:
+                    lock_free = not is_locked(f'policy:{policy.name}')
+                except Exception as e:
+                    log.warning(f"Policy {policy.name}: cannot inspect its lock ({e}); leaving job {job.pk} alone")
+                    return ended
+            if not lock_free:
+                continue  # still alive, or hung: fail_overruns frees the lock first
+            reason = (f'Still listed as running {now - since} after it started (max_runtime {policy.max_runtime}) '
+                      f'while nothing holds the policy lock: its worker was killed')
+        else:
+            if not job.created or now - job.created <= grace or _rq_job_exists(job) is not False:
+                continue
+            reason = 'Queued in NetBox but unknown to RQ (the queue was flushed): it would never have run'
+        job.terminate(status=JobStatusChoices.STATUS_ERRORED, error=reason)
+        log.warning(f"Policy {policy.name}: ended stale backup job {job.pk}: {reason}")
+        ended += 1
+    return ended
+
+
 def record_skipped(row, reason, now):
     """
     A scheduled run that could not start is recorded as a failed set, so health and alerts see it.
@@ -135,6 +194,8 @@ def tick(now=None, log=None):
             continue
         if slot <= row.last_scheduled:
             continue
+        # A job whose worker died would otherwise block this and every later slot
+        fail_stale_jobs(row, policy, now, log=log)
         active = BackupJob.get_jobs(row).filter(status__in=JobStatusChoices.ENQUEUED_STATE_CHOICES).exists()
         if active:
             log.warning(f"Policy {name}: previous backup still queued or running; skipping slot {slot:%Y-%m-%d %H:%M}")
