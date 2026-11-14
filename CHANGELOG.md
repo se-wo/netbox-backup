@@ -2,6 +2,19 @@
 
 ## 0.2.0 (unreleased)
 
+### Fixes from the release review
+
+* Prune no longer deletes the sets a restore depends on. A restored database's catalog is as old as its set, so the
+  set it was restored from, every set taken after it and the safety set came back unverified; they did not count
+  toward retention and were deleted once past `min_age`, which broke `restore rollback` inside the rollback window.
+  Catalog sync now checks the copies it finds unverified at level 1, rollback syncs the catalog as finish does, and
+  prune holds a restore's safety set and loaded set until the restore is rolled back or finalized or its rollback
+  window has closed ("kept for restore ..." in `nbbackup prune`)
+* A backup job whose worker was killed no longer blocks its policy's schedule. NetBox keeps such a job listed as
+  running, and every later slot was recorded as skipped. The scheduler now ends jobs that have been running for
+  longer than `max_runtime` + 10 minutes while the policy's lock is free, and queued jobs RQ no longer knows, as
+  errored
+
 ### M2: backends and drills
 
 * Storage drivers `gcs` (resumable uploads with `ifGenerationMatch=0`, MD5 level-1 checks, locked bucket retention

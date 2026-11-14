@@ -2,7 +2,8 @@
 Pruning. Runs on the maintenance runner with the target's prune credential; without that credential it only
 reports what it would delete. Deletion removes _COMPLETE first, so a half-deleted set is invisible rather than
 corrupt, and deletes by version where the target is versioned. Objects under an active lock are skipped and
-retried at the next prune, once the lock has expired.
+retried at the next prune, once the lock has expired. Sets a restore still needs (its safety set and the set it
+loaded) are held until the restore is rolled back or finalized or its rollback window has closed.
 """
 import logging
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from ..core import layout, sets
 from ..core.config import RetentionConfig
 from ..storage import StorageError, get_backend
 from ..storage.base import PROBE_DIR
+from . import journal as journal_mod
 from . import retention
 
 logger = logging.getLogger('netbox_backup')
@@ -43,6 +45,7 @@ class TargetReport:
     errors: list = field(default_factory=list)
     aborted_uploads: int = 0
     held: dict = field(default_factory=dict)
+    needed_by_restore: dict = field(default_factory=dict)
     probes_due: list = field(default_factory=list)
     probes_deleted: int = 0
 
@@ -68,10 +71,16 @@ def _retention_for(config, target, policy_name):
     return RetentionConfig(), None
 
 
-def prune_target(config, target, dry_run=False, log=None, now=None):
+def prune_target(config, target, dry_run=False, log=None, now=None, protected=None):
+    """
+    protected is journal.protected_sets(): {set_id: reason} for the sets an open restore needs. prune() reads it
+    once for all targets.
+    """
     from ..models import BackupCopy, BackupSet
     log = log or logger
     now = now or timezone.now()
+    if protected is None:
+        protected = journal_mod.protected_sets(now)
     report = TargetReport(target=target.name, can_delete=can_prune(target) and not dry_run)
     if config.instance_id is None:
         return report  # unpinned and no backup taken yet: nothing of ours in storage
@@ -117,6 +126,10 @@ def prune_target(config, target, dry_run=False, log=None, now=None):
 
     for listing in to_delete:
         row = rows.get(listing.set_id)
+        if listing.set_id in protected:
+            # Retention must not take away what rollback (the safety set) or a rerun (the loaded set) reads
+            report.needed_by_restore[listing.set_id] = protected[listing.set_id]
+            continue
         locked = [o.retain_until for o in listing.objects.values() if o.retain_until and o.retain_until > now]
         if locked:
             report.locked[listing.set_id] = max(locked).isoformat()
@@ -194,11 +207,12 @@ def _expired_probes(backend, instance_id, now):
 def prune(dry_run=False, log=None, targets=None):
     config = conf.get_config()
     reports = []
+    protected = journal_mod.protected_sets()
     for name, target in config.targets.items():
         if targets and name not in targets:
             continue
         try:
-            reports.append(prune_target(config, target, dry_run=dry_run, log=log))
+            reports.append(prune_target(config, target, dry_run=dry_run, log=log, protected=protected))
         except StorageError as e:
             report = TargetReport(target=name, can_delete=False)
             report.errors.append(str(e))

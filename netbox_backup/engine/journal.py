@@ -20,6 +20,11 @@ from .. import conf
 from ..core import layout, sets
 from ..storage import ObjectExists, ObjectNotFound, StorageError, get_backend
 
+# A restore that loaded (or began loading) and was neither finished, rolled back nor superseded
+UNFINISHED = ('planned', 'loading', 'loaded', 'finishing', 'failed')
+# Restores that replace a database; drills and media-only restores have nothing to roll back to in storage
+DATABASE_STRATEGIES = ('in-place', 'slot')
+
 
 def _prefix(instance_id, restore_id):
     return f'{instance_id}/journal/{restore_id}/'
@@ -39,6 +44,9 @@ class Journal:
         data = {
             'restore_id': restore_id, 'set_id': set_id, 'strategy': strategy, 'target': target_name,
             'instance_id': fields.get('source_instance_id') or conf.instance_id(), 'status': 'planned',
+            # The install that runs the restore; it differs from the set's instance with --from-instance (QA, a
+            # staging copy), and is None on a host that has no instance_id yet
+            'restored_by': conf.instance_id(),
             'steps': [], 'warnings': [],
             'started': timezone.now().isoformat(), 'seq': 0, **fields,
         }
@@ -203,3 +211,58 @@ def list_journals():
         except StorageError:
             continue
     return sorted(found.values(), key=lambda j: j.restore_id, reverse=True)
+
+
+def _needed(status, rollback_until, now):
+    """
+    Why a restore in this state still needs its sets, or None: it is unfinished, or finished with its rollback
+    window still open.
+    """
+    if status in UNFINISHED:
+        return status
+    if status == 'finished' and rollback_until is not None and now < rollback_until:
+        return f'rollback possible until {rollback_until:%Y-%m-%d %H:%M}'
+    return None
+
+
+def protected_sets(now=None):
+    """
+    {set_id: reason} for the sets a restore still needs: its safety set (rollback reloads it) and the set it
+    loaded (a rerun loads it again). Prune holds them whatever retention says, until the restore is rolled back or
+    finalized or its rollback window has closed.
+
+    Read from the journals (local spool and storage) and from the RestoreRun rows, so that a journal on a target
+    that is unreachable right now is still honoured. Journals live below the instance whose set was restored, so
+    this install also sees the restores other installs ran from its sets (a QA instance, a staging copy); those
+    are left out, or an abandoned restore elsewhere would pin a set here for good.
+    """
+    from django.utils.dateparse import parse_datetime
+    now = now or timezone.now()
+    here = conf.instance_id()
+    protected = {}
+
+    def add(restore_id, status, rollback_until, set_ids):
+        reason = _needed(status, rollback_until, now)
+        if reason:
+            for set_id in set_ids:
+                if set_id:
+                    protected.setdefault(set_id, f'restore {restore_id} ({reason})')
+
+    journals = list_journals()
+    for journal in journals:
+        elsewhere = journal.get('qa') or (journal.get('restored_by') and journal.get('restored_by') != here)
+        if journal['strategy'] in DATABASE_STRATEGIES and not elsewhere:
+            until = parse_datetime(journal['rollback_until']) if journal.get('rollback_until') else None
+            add(journal.restore_id, journal['status'], until, (journal.get('safety_set_id'), journal['set_id']))
+    # A row may be older than its journal (a restored database brings back the rows of its set), so rows speak
+    # only for restores whose journal was not found
+    known = {journal.restore_id for journal in journals}
+    try:
+        from ..models import RestoreRun
+        rows = list(RestoreRun.objects.filter(strategy__in=DATABASE_STRATEGIES).exclude(restore_id__in=known)
+                    .values_list('restore_id', 'status', 'rollback_until', 'safety_set_id', 'set_id'))
+    except Exception:  # an empty or unmigrated database
+        rows = []
+    for restore_id, status, until, safety_set_id, set_id in rows:
+        add(restore_id, status, until, (safety_set_id, set_id))
+    return protected

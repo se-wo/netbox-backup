@@ -1,6 +1,10 @@
 """
 The database catalog is a cache. Static config is mirrored into StorageTarget/BackupPolicy rows, and BackupSet/
 BackupCopy rows are rebuilt from the manifests in storage by sync(), which runs after every restore.
+
+A copy that sync finds unverified is checked at level 1 right away. A restored database knows nothing of the sets
+taken after its own set (the safety set among them) and still calls its own set "running"; left unverified, those
+sets would not count toward retention and prune would delete them.
 """
 import logging
 from datetime import timedelta
@@ -130,6 +134,7 @@ def _sync(config=None, log=None, keyring=None):
             log.warning(f"Catalog sync: target {name} unavailable: {e}")
             stats['errors'] += 1
             continue
+        checker = None  # the driver with the checksum capability the last probe observed, built when first needed
         for listing in listings:
             if not listing.complete:
                 continue
@@ -167,13 +172,16 @@ def _sync(config=None, log=None, keyring=None):
                     backup_set.save()
                     stats['updated'] += 1
             retain = [o.retain_until for o in listing.objects.values() if o.retain_until]
-            BackupCopy.objects.update_or_create(set=backup_set, target=targets[name], defaults={
+            copy, _ = BackupCopy.objects.update_or_create(set=backup_set, target=targets[name], defaults={
                 'status': CopyStatusChoices.UPLOADED if not BackupCopy.objects.filter(
                     set=backup_set, target=targets[name], status=CopyStatusChoices.VERIFIED).exists()
                 else CopyStatusChoices.VERIFIED,
                 'is_primary': bool(fields['policy'] and fields['policy'].primary_target_id == targets[name].pk),
                 'locked_until': min(retain) if retain else None,
             })
+            if keyring is not None and copy.verify_level < VerifyLevelChoices.INTEGRITY:
+                checker = checker or configured_backend(target)
+                _verify_copy(backup_set, copy, target, checker, manifest, keyring, log)
     # Sets no target holds any more
     now = timezone.now()
     gone = BackupSet.objects.filter(instance_id=instance_id, status__in=SetStatusChoices.USABLE).exclude(
@@ -192,6 +200,23 @@ def _sync(config=None, log=None, keyring=None):
         stats['qa_reports'] = qa.import_reports(config, log=log)
     log.info(f"Catalog sync: {stats['created']} imported, {stats['updated']} updated, {stats['expired']} expired")
     return stats
+
+
+def _verify_copy(backup_set, copy, target, backend, manifest, keyring, log):
+    """
+    Level 1 of one copy as sync found it, with the checks "nbbackup verify" runs. A storage error leaves the copy
+    unverified; the next sync or verification tries again.
+    """
+    # A replica is checked against the checksums its copy job recorded; a rebuilt row has none (size only)
+    expected = None if copy.is_primary else (copy.copied_objects or {})
+    try:
+        results = sets.level1(backend, manifest, keyring, target=target, expected=expected)
+    except StorageError as e:
+        log.warning(f"Catalog sync: set {backup_set.set_id} on {target.name} could not be verified: {e}")
+        return
+    if not mark_level(backup_set, results, VerifyLevelChoices.INTEGRITY, target=target.name):
+        failed = '; '.join(f"{r['check']}: {r['detail']}" for r in results if not r['ok'])
+        log.warning(f"Catalog sync: set {backup_set.set_id} on {target.name} failed level 1: {failed}")
 
 
 def mark_level(backup_set, results, level=VerifyLevelChoices.INTEGRITY, target=None):

@@ -322,6 +322,8 @@ class Command(BaseCommand):
                 self.stdout.write(f"  ~ {set_id} locked until {until}")
             for policy, reason in report.held.items():
                 self.stdout.write(self.style.WARNING(f"  ~ policy {policy} held: {reason}"))
+            for set_id, reason in report.needed_by_restore.items():
+                self.stdout.write(f"  ~ {set_id} kept for {reason}")
             for set_id in report.waiting_for_replicas:
                 self.stdout.write(f"  ~ {set_id} waits for its replicas")
             self.stdout.write(f"  kept {len(report.keep)} set(s)")
